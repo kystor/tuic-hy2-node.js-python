@@ -69,6 +69,10 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+tty_read() {
+    read "$@" </dev/tty
+}
+
 ensure_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "❌ 当前操作需要 root 权限，请切换到 root 后重试。"
@@ -152,10 +156,10 @@ read_text() {
     local value
 
     if [ -n "$default_value" ]; then
-        read -r -p "$prompt [$default_value]: " value || true
+        tty_read -r -p "$prompt [$default_value]: " value || true
         REPLY="${value:-$default_value}"
     else
-        read -r -p "$prompt: " value || true
+        tty_read -r -p "$prompt: " value || true
         REPLY="$value"
     fi
 }
@@ -166,11 +170,11 @@ read_secret() {
     local value
 
     if [ -n "$default_value" ]; then
-        read -r -s -p "$prompt [已有值，回车保持]: " value || true
+        tty_read -r -s -p "$prompt [已有值，回车保持]: " value || true
         printf '\n'
         REPLY="${value:-$default_value}"
     else
-        read -r -s -p "$prompt: " value || true
+        tty_read -r -s -p "$prompt: " value || true
         printf '\n'
         REPLY="$value"
     fi
@@ -189,7 +193,7 @@ read_yes_no() {
     fi
 
     while true; do
-        read -r -p "$prompt [$hint]: " value || true
+        tty_read -r -p "$prompt [$hint]: " value || true
         value="${value:-$default_value}"
         case "$value" in
             y|Y|yes|YES|Yes)
@@ -254,7 +258,7 @@ choose_mode() {
         echo "请选择分流模式："
         echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
         echo "2. 尽量 TCP/UDP 都走代理"
-        read -r -p "请输入选项 [1]: " value || true
+        tty_read -r -p "请输入选项 [1]: " value || true
         value="${value:-1}"
         MODE="$(normalize_mode "$value")"
         if [ -n "$MODE" ]; then
