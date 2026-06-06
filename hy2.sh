@@ -25,6 +25,8 @@ MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
 USE_SOCKS5="${USE_SOCKS5:-auto}"
 ACTION="install"
 BIN_PATH=""
+PID_FILE="hysteria.pid"
+LOG_FILE="hysteria.log"
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -268,6 +270,8 @@ list_generated_files() {
     printf '%s\n' "./${KEY_FILE}"
     printf '%s\n' "./hysteria-linux-amd64"
     printf '%s\n' "./hysteria-linux-arm64"
+    printf '%s\n' "./${PID_FILE}"
+    printf '%s\n' "./${LOG_FILE}"
 }
 
 parse_args() {
@@ -462,6 +466,10 @@ uninstall_files() {
     local file
 
     echo "🗑️  开始卸载 Hysteria2 相关文件..."
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f -- "$PID_FILE"
+    fi
     pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
 
     while IFS= read -r file; do
@@ -472,6 +480,33 @@ uninstall_files() {
     done < <(list_generated_files)
 
     echo "✅ 卸载完成。"
+}
+
+start_hysteria() {
+    if [ -f "$PID_FILE" ]; then
+        local old_pid
+        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "⚠️  检测到已有 Hysteria2 正在运行，先停止旧进程: $old_pid"
+            kill "$old_pid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f -- "$PID_FILE"
+    fi
+
+    echo "🚀 正在后台启动 Hysteria2..."
+    nohup "$BIN_PATH" server -c server.yaml >"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 1
+
+    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "✅ Hysteria2 已后台运行"
+        echo "   PID: $(cat "$PID_FILE")"
+        echo "   日志: $(pwd)/${LOG_FILE}"
+    else
+        echo "❌ Hysteria2 启动失败，请检查日志: $(pwd)/${LOG_FILE}"
+        exit 1
+    fi
 }
 
 # ---------- 检测架构 ----------
@@ -643,6 +678,11 @@ print_connection_info() {
     echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
     echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-AimiliVPN"
     echo ""
+    echo "📝 运行文件:"
+    echo "   📄 配置文件: $(pwd)/server.yaml"
+    echo "   📄 日志文件: $(pwd)/${LOG_FILE}"
+    echo "   📄 PID 文件: $(pwd)/${PID_FILE}"
+    echo ""
     if [ "$USE_SOCKS5" = "y" ]; then
         echo "⚠️ 提醒："
         echo "   1. VPS2 只是接入 VPS1 的 AimiliVPN SOCKS5。"
@@ -679,10 +719,9 @@ main() {
     download_binary
     ensure_cert
     write_config
+    start_hysteria
     SERVER_IP="$(get_server_ip)"
     print_connection_info "$SERVER_IP"
-    echo "🚀 启动 Hysteria2 服务器..."
-    exec "$BIN_PATH" server -c server.yaml
 }
 
 main "$@"
