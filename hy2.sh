@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # -*- coding: utf-8 -*-
 # Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）
 # 典型链路：客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn 出口
@@ -23,6 +23,8 @@ SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
 SOCKS5_PASS="${SOCKS5_PASS:-${AIMILI_SOCKS5_PASS:-}}"
 MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
 USE_SOCKS5="${USE_SOCKS5:-auto}"
+ACTION="install"
+BIN_PATH=""
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -39,6 +41,8 @@ usage() {
   bash hy2.sh [监听端口] [socksIP]
   bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT]
   bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]
+  bash hy2.sh del
+  bash hy2.sh --uninstall
 
 模式:
   tcp_only   仅 TCP 走代理，UDP 直连 VPS2（推荐，最稳）
@@ -48,6 +52,7 @@ usage() {
   bash hy2.sh 443 1.2.3.4 7928
   bash hy2.sh 443 1.2.3.4 7928 all_proxy
   SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
+  bash hy2.sh del
 
 环境变量:
   SOCKS_IP / AIMILI_SOCKS_IP
@@ -257,40 +262,67 @@ choose_mode() {
     done
 }
 
+list_generated_files() {
+    printf '%s\n' "./server.yaml"
+    printf '%s\n' "./${CERT_FILE}"
+    printf '%s\n' "./${KEY_FILE}"
+    printf '%s\n' "./hysteria-linux-amd64"
+    printf '%s\n' "./hysteria-linux-arm64"
+}
+
 parse_args() {
-    if [[ $# -ge 1 ]]; then
+    local positional=()
+
+    while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
                 usage
                 exit 0
                 ;;
+            del|--uninstall|uninstall|remove|rm)
+                ACTION="uninstall"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -* )
+                echo "❌ 不支持的参数: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
         esac
-    fi
+    done
 
-    if [[ $# -ge 1 && -n "${1:-}" ]]; then
-        SERVER_PORT="$1"
+    if [[ ${#positional[@]} -ge 1 && -n "${positional[0]}" ]]; then
+        SERVER_PORT="${positional[0]}"
         echo "✅ 使用命令行指定 Hysteria2 端口: $SERVER_PORT"
     else
         SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
     fi
 
-    if [[ $# -ge 2 && -n "${2:-}" ]]; then
-        SOCKS_IP="$2"
+    if [[ ${#positional[@]} -ge 2 && -n "${positional[1]}" ]]; then
+        SOCKS_IP="${positional[1]}"
         USE_SOCKS5="y"
         echo "✅ 使用命令行指定 AimiliVPN SOCKS5 地址: $SOCKS_IP"
     fi
 
-    if [[ $# -ge 3 && -n "${3:-}" ]]; then
-        SOCKS5_PORT="$3"
+    if [[ ${#positional[@]} -ge 3 && -n "${positional[2]}" ]]; then
+        SOCKS5_PORT="${positional[2]}"
         echo "✅ 使用命令行指定 AimiliVPN SOCKS5 端口: $SOCKS5_PORT"
     fi
 
-    if [[ $# -ge 4 && -n "${4:-}" ]]; then
-        MODE="$4"
+    if [[ ${#positional[@]} -ge 4 && -n "${positional[3]}" ]]; then
+        MODE="${positional[3]}"
         echo "✅ 使用命令行指定模式: $MODE"
     fi
 
-    if [[ $# -gt 4 ]]; then
+    if [[ ${#positional[@]} -gt 4 ]]; then
         echo "❌ 参数过多。"
         usage
         exit 1
@@ -424,6 +456,22 @@ print_summary() {
         echo "   🚦 分流模式: 全部直连 VPS2"
     fi
     echo "=========================================================================="
+}
+
+uninstall_files() {
+    local file
+
+    echo "🗑️  开始卸载 Hysteria2 相关文件..."
+    pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
+
+    while IFS= read -r file; do
+        if [ -e "$file" ]; then
+            rm -f -- "$file"
+            echo "✅ 已删除: $file"
+        fi
+    done < <(list_generated_files)
+
+    echo "✅ 卸载完成。"
 }
 
 # ---------- 检测架构 ----------
@@ -612,6 +660,11 @@ print_connection_info() {
 # ---------- 主逻辑 ----------
 main() {
     parse_args "$@"
+
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall_files
+        exit 0
+    fi
 
     if [ -t 0 ]; then
         interactive_config
