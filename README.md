@@ -9,6 +9,10 @@
 ```
 curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//' | bash
 ```
+* 卸载脚本
+```
+curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//' | bash -s -- del
+```
 
 
 ---------------------------------------
