@@ -1,80 +1,142 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+# Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）
+# 典型链路：客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn 出口
 
 set -euo pipefail
 
+# ---------- 默认配置 ----------
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-DEFAULT_PORT="${DEFAULT_PORT:-22222}"
-AUTH_PASSWORD="${AUTH_PASSWORD:-ieshare2025}"
-CERT_FILE="${CERT_FILE:-cert.pem}"
-KEY_FILE="${KEY_FILE:-key.pem}"
-SNI="${SNI:-www.bing.com}"
+DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
+AUTH_PASSWORD="${AUTH_PASSWORD:-ieshare2025}"  # Hysteria2 默认连接密码
+CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
+KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
+SNI="${SNI:-www.bing.com}"                     # 伪装域名
 ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-SERVER_PORT="${SERVER_PORT:-}"
-MODE="${MODE:-tcp_proxy_udp_direct}"
-LANDING_PROXY_HOST="${LANDING_PROXY_HOST:-${UPSTREAM_SOCKS_HOST:-}}"
-LANDING_PROXY_PORT="${LANDING_PROXY_PORT:-${UPSTREAM_SOCKS_PORT:-7928}}"
-LANDING_PROXY_USER="${LANDING_PROXY_USER:-${UPSTREAM_SOCKS_USER:-}}"
-LANDING_PROXY_PASS="${LANDING_PROXY_PASS:-${UPSTREAM_SOCKS_PASS:-}}"
-USE_LANDING_PROXY="${USE_LANDING_PROXY:-auto}"
-LANDING_PROXY_AUTH_ENABLED="${LANDING_PROXY_AUTH_ENABLED:-auto}"
+# AimiliVPN SOCKS5 默认习惯
+SOCKS_IP="${SOCKS_IP:-${AIMILI_SOCKS_IP:-}}"
+SOCKS5_PORT="${SOCKS5_PORT:-${AIMILI_SOCKS5_PORT:-7928}}"
+SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
+SOCKS5_PASS="${SOCKS5_PASS:-${AIMILI_SOCKS5_PASS:-}}"
+MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
+USE_SOCKS5="${USE_SOCKS5:-auto}"
+# ------------------------------
 
-ACTION="install"
-BIN_PATH=""
-
-line() {
-    printf '%s\n' "========================================================================"
-}
-
-info() {
-    printf '[INFO] %s\n' "$*"
-}
-
-ok() {
-    printf '[OK] %s\n' "$*"
-}
-
-warn() {
-    printf '[WARN] %s\n' "$*"
-}
-
-die() {
-    printf '[ERROR] %s\n' "$*" >&2
-    exit 1
-}
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）"
+echo "链路: 客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn"
+echo "支持参数: bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
 usage() {
     cat <<'EOF'
-用法：
+用法:
   bash hy2.sh
   bash hy2.sh [监听端口]
-  bash hy2.sh [监听端口] [落地代理_HOST] [落地代理_SOCKS5端口]
-  bash hy2.sh --uninstall
-  bash hy2.sh del
+  bash hy2.sh [监听端口] [socksIP]
+  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT]
+  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]
 
-示例：
-  bash hy2.sh
-  bash hy2.sh 443
+模式:
+  tcp_only   仅 TCP 走代理，UDP 直连 VPS2（推荐，最稳）
+  all_proxy  尽量 TCP/UDP 都走代理（取决于上游 SOCKS5 是否支持 UDP）
+
+示例:
   bash hy2.sh 443 1.2.3.4 7928
-  MODE=all_proxy bash hy2.sh 443 1.2.3.4 7928
-  LANDING_PROXY_USER=user LANDING_PROXY_PASS=pass bash hy2.sh 443 1.2.3.4 7928
-  bash hy2.sh --uninstall
-  bash hy2.sh del
+  bash hy2.sh 443 1.2.3.4 7928 all_proxy
+  SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
 
-说明：
-  1. VPS2 配的是“落地代理”的 SOCKS5 地址，不是当前落地 IP。
-  2. 想换出口 IP，只需要去落地代理的 milivpn/VPNGate 切节点。
-  3. 默认模式是 TCP 走落地代理、UDP 直连 VPS2。
-  4. `del` 和 `--uninstall` 都表示卸载，只删除本脚本生成的 Hysteria2 文件，不删除当前项目源码。
+环境变量:
+  SOCKS_IP / AIMILI_SOCKS_IP
+  SOCKS5_PORT / AIMILI_SOCKS5_PORT
+  SOCKS5_USER / AIMILI_SOCKS5_USER
+  SOCKS5_PASS / AIMILI_SOCKS5_PASS
+  MODE=tcp_only|all_proxy
 EOF
+}
+
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "❌ 当前操作需要 root 权限，请切换到 root 后重试。"
+        exit 1
+    fi
+}
+
+detect_pkg_manager() {
+    if has_cmd apt-get; then
+        echo "apt"
+    elif has_cmd dnf; then
+        echo "dnf"
+    elif has_cmd yum; then
+        echo "yum"
+    elif has_cmd apk; then
+        echo "apk"
+    elif has_cmd zypper; then
+        echo "zypper"
+    else
+        echo ""
+    fi
+}
+
+install_openssl() {
+    local pkg_manager
+    pkg_manager="$(detect_pkg_manager)"
+
+    if [ -z "$pkg_manager" ]; then
+        echo "❌ 未找到支持的包管理器，无法自动安装 openssl，请手动安装后重试。"
+        exit 1
+    fi
+
+    ensure_root
+    echo "📦 检测到未安装 openssl，尝试自动安装（$pkg_manager）..."
+
+    case "$pkg_manager" in
+        apt)
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y openssl
+            ;;
+        dnf)
+            dnf install -y openssl
+            ;;
+        yum)
+            yum install -y openssl
+            ;;
+        apk)
+            apk add --no-cache openssl
+            ;;
+        zypper)
+            zypper --non-interactive install openssl
+            ;;
+    esac
+
+    if has_cmd openssl; then
+        echo "✅ openssl 安装完成。"
+    else
+        echo "❌ openssl 安装失败，请手动安装后重试。"
+        exit 1
+    fi
+}
+
+ensure_openssl() {
+    if has_cmd openssl; then
+        return
+    fi
+    install_openssl
 }
 
 validate_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    (( port >= 1 && port <= 65535 ))
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
 }
 
 read_text() {
@@ -82,7 +144,7 @@ read_text() {
     local default_value="${2:-}"
     local value
 
-    if [[ -n "$default_value" ]]; then
+    if [ -n "$default_value" ]; then
         read -r -p "$prompt [$default_value]: " value || true
         REPLY="${value:-$default_value}"
     else
@@ -96,7 +158,7 @@ read_secret() {
     local default_value="${2:-}"
     local value
 
-    if [[ -n "$default_value" ]]; then
+    if [ -n "$default_value" ]; then
         read -r -s -p "$prompt [已有值，回车保持]: " value || true
         printf '\n'
         REPLY="${value:-$default_value}"
@@ -113,7 +175,7 @@ read_yes_no() {
     local value
     local hint
 
-    if [[ "$default_value" == "y" ]]; then
+    if [ "$default_value" = "y" ]; then
         hint="Y/n"
     else
         hint="y/N"
@@ -132,7 +194,7 @@ read_yes_no() {
                 return 0
                 ;;
             *)
-                warn "请输入 y 或 n。"
+                echo "⚠️  请输入 y 或 n"
                 ;;
         esac
     done
@@ -147,285 +209,282 @@ ask_port() {
         if validate_port "$REPLY"; then
             return 0
         fi
-        warn "端口必须是 1-65535 之间的数字。"
+        echo "⚠️  端口必须是 1-65535 之间的数字"
     done
 }
 
-choose_mode() {
-    local value
-
-    while true; do
-        printf '%s\n' "请选择分流模式："
-        printf '%s\n' "1. TCP 走落地代理，UDP 直连（推荐）"
-        printf '%s\n' "2. TCP/UDP 都走落地代理"
-        read -r -p "请输入选项 [1]: " value || true
-        value="${value:-1}"
-        case "$value" in
-            1)
-                MODE="tcp_proxy_udp_direct"
-                return 0
-                ;;
-            2)
-                MODE="all_proxy"
-                return 0
-                ;;
-            *)
-                warn "请输入 1 或 2。"
-                ;;
-        esac
-    done
+normalize_mode() {
+    case "${1,,}" in
+        tcp_only|tcp|tcp_proxy_udp_direct|1)
+            echo "tcp_only"
+            ;;
+        all_proxy|all|proxy_all|2)
+            echo "all_proxy"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
 mode_text() {
     case "$MODE" in
-        tcp_proxy_udp_direct) printf '%s' 'TCP 走落地代理 / UDP 直连' ;;
-        all_proxy) printf '%s' 'TCP/UDP 都走落地代理' ;;
-        direct) printf '%s' '全部直连 VPS2' ;;
-        *) printf '%s' "$MODE" ;;
+        tcp_only)
+            echo "仅 TCP 走代理，UDP 直连 VPS2"
+            ;;
+        all_proxy)
+            echo "尽量 TCP/UDP 都走代理"
+            ;;
+        *)
+            echo "$MODE"
+            ;;
     esac
 }
 
-list_generated_files() {
-    printf '%s\n' "./server.yaml"
-    printf '%s\n' "./${CERT_FILE}"
-    printf '%s\n' "./${KEY_FILE}"
-    printf '%s\n' "./hysteria-linux-amd64"
-    printf '%s\n' "./hysteria-linux-arm64"
+choose_mode() {
+    local value
+    while true; do
+        echo "请选择分流模式："
+        echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
+        echo "2. 尽量 TCP/UDP 都走代理"
+        read -r -p "请输入选项 [1]: " value || true
+        value="${value:-1}"
+        MODE="$(normalize_mode "$value")"
+        if [ -n "$MODE" ]; then
+            return 0
+        fi
+        echo "⚠️  请输入 1 或 2"
+    done
 }
 
 parse_args() {
-    local positional=()
-
-    while [[ $# -gt 0 ]]; do
+    if [[ $# -ge 1 ]]; then
         case "$1" in
             -h|--help)
                 usage
                 exit 0
                 ;;
-            --uninstall|del|uninstall|remove|rm)
-                ACTION="uninstall"
-                shift
-                ;;
-            --)
-                shift
-                break
-                ;;
-            -*)
-                die "不支持的参数: $1"
-                ;;
-            *)
-                positional+=("$1")
-                shift
-                ;;
         esac
-    done
-
-    if [[ ${#positional[@]} -ge 1 ]]; then
-        SERVER_PORT="${positional[0]}"
-    fi
-    if [[ ${#positional[@]} -ge 2 ]]; then
-        LANDING_PROXY_HOST="${positional[1]}"
-        USE_LANDING_PROXY="y"
-    fi
-    if [[ ${#positional[@]} -ge 3 ]]; then
-        LANDING_PROXY_PORT="${positional[2]}"
-    fi
-    if [[ ${#positional[@]} -gt 3 ]]; then
-        die "参数过多。使用 --help 查看用法。"
-    fi
-}
-
-normalize_config() {
-    [[ -n "$SERVER_PORT" ]] || SERVER_PORT="$DEFAULT_PORT"
-
-    if [[ "$USE_LANDING_PROXY" == "auto" ]]; then
-        if [[ -n "$LANDING_PROXY_HOST" ]]; then
-            USE_LANDING_PROXY="y"
-        else
-            USE_LANDING_PROXY="n"
-        fi
     fi
 
-    if [[ "$LANDING_PROXY_AUTH_ENABLED" == "auto" ]]; then
-        if [[ -n "$LANDING_PROXY_USER" || -n "$LANDING_PROXY_PASS" ]]; then
-            LANDING_PROXY_AUTH_ENABLED="y"
-        else
-            LANDING_PROXY_AUTH_ENABLED="n"
-        fi
+    if [[ $# -ge 1 && -n "${1:-}" ]]; then
+        SERVER_PORT="$1"
+        echo "✅ 使用命令行指定 Hysteria2 端口: $SERVER_PORT"
+    else
+        SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
     fi
 
-    if [[ "$USE_LANDING_PROXY" != "y" ]]; then
-        MODE="direct"
-        LANDING_PROXY_HOST=""
-        LANDING_PROXY_PORT="7928"
-        LANDING_PROXY_USER=""
-        LANDING_PROXY_PASS=""
-        LANDING_PROXY_AUTH_ENABLED="n"
+    if [[ $# -ge 2 && -n "${2:-}" ]]; then
+        SOCKS_IP="$2"
+        USE_SOCKS5="y"
+        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 地址: $SOCKS_IP"
+    fi
+
+    if [[ $# -ge 3 && -n "${3:-}" ]]; then
+        SOCKS5_PORT="$3"
+        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 端口: $SOCKS5_PORT"
+    fi
+
+    if [[ $# -ge 4 && -n "${4:-}" ]]; then
+        MODE="$4"
+        echo "✅ 使用命令行指定模式: $MODE"
+    fi
+
+    if [[ $# -gt 4 ]]; then
+        echo "❌ 参数过多。"
+        usage
+        exit 1
     fi
 }
 
 interactive_config() {
-    local default_use_proxy="y"
+    local default_use_socks="y"
     local default_auth="n"
 
     ask_port "请输入 Hysteria2 监听端口" "$SERVER_PORT"
     SERVER_PORT="$REPLY"
 
-    if [[ "$USE_LANDING_PROXY" == "n" ]]; then
-        default_use_proxy="n"
+    if [ "$USE_SOCKS5" = "auto" ]; then
+        if [ -n "$SOCKS_IP" ]; then
+            USE_SOCKS5="y"
+        else
+            USE_SOCKS5="n"
+        fi
     fi
-    read_yes_no "是否使用落地代理 SOCKS5 出站" "$default_use_proxy"
-    USE_LANDING_PROXY="$REPLY"
 
-    if [[ "$USE_LANDING_PROXY" == "y" ]]; then
+    if [ "$USE_SOCKS5" = "n" ]; then
+        default_use_socks="n"
+    fi
+
+    read_yes_no "是否使用 AimiliVPN SOCKS5 出站" "$default_use_socks"
+    USE_SOCKS5="$REPLY"
+
+    if [ "$USE_SOCKS5" = "y" ]; then
         while true; do
-            read_text "请输入落地代理公网 IP 或域名" "$LANDING_PROXY_HOST"
-            LANDING_PROXY_HOST="$REPLY"
-            [[ -n "$LANDING_PROXY_HOST" ]] && break
-            warn "落地代理地址不能为空。"
+            read_text "请输入 VPS1 的 AimiliVPN SOCKS5 地址(IP或域名)" "$SOCKS_IP"
+            SOCKS_IP="$REPLY"
+            if [ -n "$SOCKS_IP" ]; then
+                break
+            fi
+            echo "⚠️  SOCKS5 地址不能为空"
         done
 
-        ask_port "请输入落地代理 SOCKS5 端口" "$LANDING_PROXY_PORT"
-        LANDING_PROXY_PORT="$REPLY"
+        ask_port "请输入 VPS1 的 AimiliVPN SOCKS5 端口" "$SOCKS5_PORT"
+        SOCKS5_PORT="$REPLY"
 
-        if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
+        if [ -n "$SOCKS5_USER" ] || [ -n "$SOCKS5_PASS" ]; then
             default_auth="y"
         fi
-        read_yes_no "落地代理 SOCKS5 是否需要账号密码认证" "$default_auth"
-        LANDING_PROXY_AUTH_ENABLED="$REPLY"
 
-        if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
+        read_yes_no "SOCKS5 是否需要账号密码认证" "$default_auth"
+        if [ "$REPLY" = "y" ]; then
             while true; do
-                read_text "请输入落地代理 SOCKS5 用户名" "$LANDING_PROXY_USER"
-                LANDING_PROXY_USER="$REPLY"
-                [[ -n "$LANDING_PROXY_USER" ]] && break
-                warn "用户名不能为空。"
+                read_text "请输入 SOCKS5 用户名" "$SOCKS5_USER"
+                SOCKS5_USER="$REPLY"
+                if [ -n "$SOCKS5_USER" ]; then
+                    break
+                fi
+                echo "⚠️  用户名不能为空"
             done
 
             while true; do
-                read_secret "请输入落地代理 SOCKS5 密码" "$LANDING_PROXY_PASS"
-                LANDING_PROXY_PASS="$REPLY"
-                [[ -n "$LANDING_PROXY_PASS" ]] && break
-                warn "密码不能为空。"
+                read_secret "请输入 SOCKS5 密码" "$SOCKS5_PASS"
+                SOCKS5_PASS="$REPLY"
+                if [ -n "$SOCKS5_PASS" ]; then
+                    break
+                fi
+                echo "⚠️  密码不能为空"
             done
         else
-            LANDING_PROXY_USER=""
-            LANDING_PROXY_PASS=""
+            SOCKS5_USER=""
+            SOCKS5_PASS=""
         fi
 
         choose_mode
     else
-        MODE="direct"
-        LANDING_PROXY_HOST=""
-        LANDING_PROXY_PORT="7928"
-        LANDING_PROXY_USER=""
-        LANDING_PROXY_PASS=""
-        LANDING_PROXY_AUTH_ENABLED="n"
+        SOCKS_IP=""
+        SOCKS5_USER=""
+        SOCKS5_PASS=""
+        MODE="tcp_only"
     fi
 }
 
 validate_config() {
-    validate_port "$SERVER_PORT" || die "Hysteria2 监听端口无效: $SERVER_PORT"
+    if ! validate_port "$SERVER_PORT"; then
+        echo "❌ Hysteria2 监听端口无效: $SERVER_PORT"
+        exit 1
+    fi
 
-    case "$USE_LANDING_PROXY" in
-        y|n) ;;
-        *) die "USE_LANDING_PROXY 只能是 y 或 n" ;;
-    esac
+    if [ "$USE_SOCKS5" = "y" ]; then
+        if [ -z "$SOCKS_IP" ]; then
+            echo "❌ 已启用 AimiliVPN SOCKS5，但地址为空。"
+            exit 1
+        fi
 
-    if [[ "$USE_LANDING_PROXY" == "y" ]]; then
-        [[ -n "$LANDING_PROXY_HOST" ]] || die "已启用落地代理，但地址为空。"
-        validate_port "$LANDING_PROXY_PORT" || die "落地代理 SOCKS5 端口无效: $LANDING_PROXY_PORT"
-        case "$MODE" in
-            tcp_proxy_udp_direct|all_proxy) ;;
-            *) die "MODE 无效: $MODE" ;;
-        esac
+        if ! validate_port "$SOCKS5_PORT"; then
+            echo "❌ AimiliVPN SOCKS5 端口无效: $SOCKS5_PORT"
+            exit 1
+        fi
 
-        case "$LANDING_PROXY_AUTH_ENABLED" in
-            y|n) ;;
-            *) die "LANDING_PROXY_AUTH_ENABLED 只能是 y 或 n" ;;
-        esac
+        MODE="$(normalize_mode "$MODE")"
+        if [ -z "$MODE" ]; then
+            echo "❌ 模式无效，仅支持: tcp_only 或 all_proxy"
+            exit 1
+        fi
 
-        if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
-            [[ -n "$LANDING_PROXY_USER" ]] || die "已启用落地代理认证，但用户名为空。"
-            [[ -n "$LANDING_PROXY_PASS" ]] || die "已启用落地代理认证，但密码为空。"
+        if { [ -n "$SOCKS5_USER" ] && [ -z "$SOCKS5_PASS" ]; } || { [ -z "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; }; then
+            echo "❌ SOCKS5 用户名和密码必须同时提供，或同时留空。"
+            exit 1
         fi
     else
-        MODE="direct"
+        SOCKS_IP=""
+        SOCKS5_USER=""
+        SOCKS5_PASS=""
+        MODE="tcp_only"
     fi
 }
 
 print_summary() {
-    line
-    printf '%s\n' "配置确认"
-    printf '%s\n' "Hysteria2 监听端口 : $SERVER_PORT"
-    printf '%s\n' "Hysteria2 连接密码 : $AUTH_PASSWORD"
-    printf '%s\n' "伪装 SNI           : $SNI"
-    printf '%s\n' "ALPN               : $ALPN"
-    printf '%s\n' "分流模式           : $(mode_text)"
-    if [[ "$USE_LANDING_PROXY" == "y" ]]; then
-        printf '%s\n' "落地代理 SOCKS5    : ${LANDING_PROXY_HOST}:${LANDING_PROXY_PORT}"
-        if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
-            printf '%s\n' "落地代理认证       : 已启用"
-            printf '%s\n' "落地代理账号       : $LANDING_PROXY_USER"
+    echo "=========================================================================="
+    echo "📋 配置确认:"
+    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
+    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    echo "   🌐 伪装 SNI: $SNI"
+    echo "   🧩 ALPN: $ALPN"
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "   🧦 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
+            echo "   🔐 SOCKS5 认证: 已启用"
         else
-            printf '%s\n' "落地代理认证       : 未启用"
+            echo "   🔓 SOCKS5 认证: 未启用"
         fi
+        echo "   🚦 分流模式: $(mode_text)"
     else
-        printf '%s\n' "落地代理 SOCKS5    : 未使用"
+        echo "   🧦 AimiliVPN SOCKS5: 未使用"
+        echo "   🚦 分流模式: 全部直连 VPS2"
     fi
-    line
+    echo "=========================================================================="
 }
 
-confirm_or_exit() {
-    read_yes_no "是否确认以上配置并继续部署" "y"
-    [[ "$REPLY" == "y" ]] || exit 0
-}
-
+# ---------- 检测架构 ----------
+# 自动检测 VPS2 的 CPU 架构，以决定下载哪个版本的内核
 arch_name() {
     local machine
-    machine="$(uname -m | tr '[:upper:]' '[:lower:]')"
-    case "$machine" in
-        *arm64*|*aarch64*) printf '%s' 'arm64' ;;
-        *x86_64*|*amd64*) printf '%s' 'amd64' ;;
-        *) printf '%s' '' ;;
-    esac
+    machine=$(uname -m | tr '[:upper:]' '[:lower:]')
+    if [[ "$machine" == *"arm64"* ]] || [[ "$machine" == *"aarch64"* ]]; then
+        echo "arm64"
+    elif [[ "$machine" == *"x86_64"* ]] || [[ "$machine" == *"amd64"* ]]; then
+        echo "amd64"
+    else
+        echo ""
+    fi
 }
 
 download_binary() {
     local arch
-    local bin_name
     local url
 
-    arch="$(arch_name)"
-    [[ -n "$arch" ]] || die "无法识别 CPU 架构: $(uname -m)"
-
-    bin_name="hysteria-linux-${arch}"
-    BIN_PATH="./${bin_name}"
-
-    if [[ -f "$BIN_PATH" ]]; then
-        ok "Hysteria2 二进制已存在，跳过下载。"
-        return 0
+    if ! has_cmd curl; then
+        echo "❌ 未检测到 curl，请先安装 curl 后重试。"
+        exit 1
     fi
 
-    url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${bin_name}"
-    info "开始下载: $url"
+    arch="$(arch_name)"
+    if [ -z "$arch" ]; then
+        echo "❌ 无法识别 CPU 架构: $(uname -m)"
+        exit 1
+    fi
+
+    BIN_NAME="hysteria-linux-${arch}"
+    BIN_PATH="./${BIN_NAME}"
+
+    if [ -f "$BIN_PATH" ]; then
+        echo "✅ 二进制已存在，跳过下载。"
+        return
+    fi
+
+    url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    echo "⏳ 下载: $url"
     curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"
     chmod +x "$BIN_PATH"
-    ok "下载完成: $BIN_PATH"
+    echo "✅ 下载完成并设置可执行: $BIN_PATH"
 }
 
+# ---------- 生成证书 ----------
 ensure_cert() {
-    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-        ok "发现现有证书，直接复用。"
-        return 0
+    if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+        echo "✅ 发现证书，使用现有 cert/key。"
+        return
     fi
 
-    info "未发现证书，正在生成自签证书..."
+    ensure_openssl
+    echo "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1）..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
-    ok "证书生成成功。"
+    echo "✅ 证书生成成功。"
 }
 
+# ---------- 写配置文件 ----------
 write_config() {
     {
         cat <<EOF
@@ -450,42 +509,49 @@ quic:
   max_conn_receive_window: 262144
 EOF
 
-        if [[ "$USE_LANDING_PROXY" == "y" ]]; then
+        if [ "$USE_SOCKS5" = "y" ]; then
             cat <<EOF
 
+# === AimiliVPN SOCKS5 出站 ===
 outbounds:
-  - name: landing_proxy
+  - name: aimili_socks
     type: socks5
     socks5:
-      addr: "${LANDING_PROXY_HOST}:${LANDING_PROXY_PORT}"
+      addr: "${SOCKS_IP}:${SOCKS5_PORT}"
 EOF
 
-            if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
+            if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
                 cat <<EOF
-      username: "${LANDING_PROXY_USER}"
-      password: "${LANDING_PROXY_PASS}"
+      username: "${SOCKS5_USER}"
+      password: "${SOCKS5_PASS}"
 EOF
             fi
 
-            if [[ "$MODE" == "tcp_proxy_udp_direct" ]]; then
+            if [ "$MODE" = "tcp_only" ]; then
                 cat <<'EOF'
 
+# === 分流规则 ===
+# TCP 走 VPS1 的 AimiliVPN SOCKS5，UDP 由 VPS2 直连
 acl:
   inline:
-    - landing_proxy(network:tcp)
+    - aimili_socks(network:tcp)
     - direct(network:udp)
 EOF
             else
                 cat <<'EOF'
 
+# === 分流规则 ===
+# 尽量全走 VPS1 的 AimiliVPN SOCKS5
 acl:
   inline:
-    - landing_proxy(all)
+    - aimili_socks(all)
 EOF
             fi
         else
             cat <<'EOF'
 
+# === 分流规则 ===
+# 未使用 SOCKS5，全部直连 VPS2
 acl:
   inline:
     - direct(all)
@@ -493,115 +559,76 @@ EOF
         fi
     } > server.yaml
 
-    ok "已写入配置文件: server.yaml"
+    echo "✅ 写入配置 server.yaml 成功。"
 }
 
+# ---------- 获取服务器 IP ----------
 get_server_ip() {
-    curl --max-time 10 https://api.ipify.org 2>/dev/null || printf '%s' 'YOUR_VPS2_IP'
+    local ip
+    ip="$(curl --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    echo "${ip:-YOUR_SERVER_IP}"
 }
 
+# ---------- 打印连接信息 ----------
 print_connection_info() {
-    local server_ip="$1"
+    local ip="$1"
 
-    line
-    printf '%s\n' "部署完成"
-    printf '%s\n' "VPS2 公网 IP        : $server_ip"
-    printf '%s\n' "Hysteria2 监听端口  : $SERVER_PORT"
-    printf '%s\n' "Hysteria2 连接密码  : $AUTH_PASSWORD"
-    printf '%s\n' "分流模式            : $(mode_text)"
-    if [[ "$USE_LANDING_PROXY" == "y" ]]; then
-        printf '%s\n' "落地代理 SOCKS5     : ${LANDING_PROXY_HOST}:${LANDING_PROXY_PORT}"
-        if [[ "$LANDING_PROXY_AUTH_ENABLED" == "y" ]]; then
-            printf '%s\n' "落地代理认证        : 已启用"
+    echo "🎉 Hysteria2 部署成功！"
+    echo "=========================================================================="
+    echo "📋 服务器信息:"
+    echo "   🌐 VPS2 公网IP: $ip"
+    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
+    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "   🧦 VPS1 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
+            echo "   🔐 SOCKS5 认证: 已启用"
         else
-            printf '%s\n' "落地代理认证        : 未启用"
+            echo "   🔓 SOCKS5 认证: 未启用"
         fi
+        echo "   🚦 分流模式: $(mode_text)"
     else
-        printf '%s\n' "落地代理 SOCKS5     : 未使用"
+        echo "   🧦 AimiliVPN SOCKS5: 未使用"
+        echo "   🚦 分流模式: 全部直连 VPS2"
     fi
-    line
-    printf '%s\n' "节点链接"
-    printf '%s\n' "hysteria2://${AUTH_PASSWORD}@${server_ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-Landing-Proxy"
-    line
-    printf '%s\n' "说明"
-    printf '%s\n' "1. 客户端实际连接的是 VPS2。"
-    if [[ "$USE_LANDING_PROXY" == "y" ]]; then
-        printf '%s\n' "2. VPS2 会把流量转发到落地代理的 SOCKS5。"
-        printf '%s\n' "3. 真正显示的出口 IP 由落地代理当前 milivpn/VPNGate 节点决定。"
-        printf '%s\n' "4. 想换落地 IP，只需要去落地代理切节点，不需要改 VPS2。"
-        if [[ "$MODE" == "tcp_proxy_udp_direct" ]]; then
-            printf '%s\n' "5. 当前模式下 TCP 走落地代理，UDP 仍从 VPS2 直连。"
+    echo ""
+    echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
+    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-AimiliVPN"
+    echo ""
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "⚠️ 提醒："
+        echo "   1. VPS2 只是接入 VPS1 的 AimiliVPN SOCKS5。"
+        echo "   2. 真正的落地出口 IP 由 VPS1 当前连接的 milivpn/VPNGate 节点决定。"
+        echo "   3. 想换落地 IP，只需要去 VPS1 切 AimiliVPN 的出口节点，不需要改 VPS2。"
+        if [ "$MODE" = "all_proxy" ]; then
+            echo "   4. 当前为尽量全代理模式，UDP 是否稳定取决于上游 SOCKS5 对 UDP 的支持。"
         else
-            printf '%s\n' "5. 当前模式尝试让 TCP/UDP 都走落地代理，UDP 稳定性取决于上游支持。"
+            echo "   4. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
         fi
-    else
-        printf '%s\n' "2. 当前未配置落地代理，流量将直接从 VPS2 出口。"
     fi
-    line
+    echo "=========================================================================="
 }
 
-uninstall_files() {
-    local file
-
-    line
-    printf '%s\n' "将删除以下文件："
-    while IFS= read -r file; do
-        printf '  - %s\n' "$file"
-    done < <(list_generated_files)
-    printf '%s\n' "不会删除当前项目源码。"
-    line
-
-    read_yes_no "是否确认卸载" "n"
-    [[ "$REPLY" == "y" ]] || exit 0
-
-    while IFS= read -r file; do
-        if [[ -e "$file" ]]; then
-            rm -f -- "$file"
-            ok "已删除: $file"
-        else
-            info "文件不存在，跳过: $file"
-        fi
-    done < <(list_generated_files)
-
-    line
-    ok "卸载完成。"
-    line
-}
-
+# ---------- 主逻辑 ----------
 main() {
-    line
-    printf '%s\n' "Hysteria2 部署脚本"
-    printf '%s\n' "链路: 客户端 -> VPS2(Hysteria2) -> 落地代理 SOCKS5 -> milivpn/VPNGate 出口"
-    line
-
     parse_args "$@"
 
-    if [[ "$ACTION" == "uninstall" ]]; then
-        uninstall_files
-        exit 0
-    fi
-
-    normalize_config
-
-    if [[ -t 0 ]]; then
+    if [ -t 0 ]; then
         interactive_config
+        print_summary
+        read_yes_no "确认以上配置并继续部署" "y"
+        if [ "$REPLY" != "y" ]; then
+            exit 0
+        fi
     fi
 
     validate_config
-
-    if [[ -t 0 ]]; then
-        print_summary
-        confirm_or_exit
-    fi
-
     download_binary
     ensure_cert
     write_config
-
     SERVER_IP="$(get_server_ip)"
     print_connection_info "$SERVER_IP"
-
-    info "正在启动 Hysteria2 服务器..."
+    echo "🚀 启动 Hysteria2 服务器..."
     exec "$BIN_PATH" server -c server.yaml
 }
 
