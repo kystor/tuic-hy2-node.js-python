@@ -1,91 +1,538 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 自动化部署脚本（支持一键卸载 del + 自动放行防火墙 + 自动后台完全不屏蔽输出运行）
-# 适用于超低内存环境（32-64MB）
+# Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）
+# 典型链路：客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn 出口
 
-set -e # 遇到错误立刻停止脚本运行，防止产生连锁反应
+set -euo pipefail
 
 # ---------- 默认配置 ----------
-HYSTERIA_VERSION="v2.6.5"
-DEFAULT_PORT=22222          # 当用户不输入端口时，使用的默认端口
-AUTH_PASSWORD="ieshare2025"   # 客户端连接所需的认证密码
-CERT_FILE="cert.pem"        # 证书公钥文件名
-KEY_FILE="key.pem"          # 证书私钥文件名
-SNI="www.bing.com"          # 伪装域名（用于绕过防火墙探测）
-ALPN="h3"                   # 应用层协议协商，指定为 HTTP/3 协议
+HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
+DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
+AUTH_PASSWORD="${AUTH_PASSWORD:-ieshare2025}"  # Hysteria2 默认连接密码
+CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
+KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
+SNI="${SNI:-www.bing.com}"                     # 伪装域名
+ALPN="${ALPN:-h3}"
+UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
+DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
+
+# AimiliVPN SOCKS5 默认习惯
+SOCKS_IP="${SOCKS_IP:-${AIMILI_SOCKS_IP:-}}"
+SOCKS5_PORT="${SOCKS5_PORT:-${AIMILI_SOCKS5_PORT:-7928}}"
+SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
+SOCKS5_PASS="${SOCKS5_PASS:-${AIMILI_SOCKS5_PASS:-}}"
+MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
+USE_SOCKS5="${USE_SOCKS5:-auto}"
+ACTION="install"
+BIN_PATH=""
+PID_FILE="hysteria.pid"
+LOG_FILE="hysteria.log"
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 自动化部署与清理脚本"
-echo "安装示例：bash hy2.sh 443"
-echo "卸载示例：bash hy2.sh del"
+echo "Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）"
+echo "链路: 客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn"
+echo "支持参数: bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-# ---------- 核心功能：一键卸载 ----------
-uninstall_hy2() {
-    echo "🗑️ 检测到 'del' 参数，开始执行深度卸载与清理..."
-    
-    # 1. 尝试提取原有配置中的端口号（为了清理防火墙）
-    local old_port=""
-    if [ -f "server.yaml" ]; then
-        # 读取 server.yaml 中 listen 后面的端口数字
-        old_port=$(grep -oP 'listen: ":\K\d+' server.yaml || true)
+usage() {
+    cat <<'EOF'
+用法:
+  bash hy2.sh
+  bash hy2.sh [监听端口]
+  bash hy2.sh [监听端口] [socksIP]
+  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT]
+  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]
+  bash hy2.sh del
+  bash hy2.sh --uninstall
+
+模式:
+  tcp_only   仅 TCP 走代理，UDP 直连 VPS2（推荐，最稳）
+  all_proxy  尽量 TCP/UDP 都走代理（取决于上游 SOCKS5 是否支持 UDP）
+
+示例:
+  bash hy2.sh 443 1.2.3.4 7928
+  bash hy2.sh 443 1.2.3.4 7928 all_proxy
+  SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
+  bash hy2.sh del
+
+环境变量:
+  SOCKS_IP / AIMILI_SOCKS_IP
+  SOCKS5_PORT / AIMILI_SOCKS5_PORT
+  SOCKS5_USER / AIMILI_SOCKS5_USER
+  SOCKS5_PASS / AIMILI_SOCKS5_PASS
+  MODE=tcp_only|all_proxy
+EOF
+}
+
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+tty_read() {
+    read "$@" </dev/tty
+}
+
+tty_print() {
+    printf '%s' "$1" >/dev/tty
+}
+
+tty_prompt_read() {
+    local prompt="$1"
+    local silent="${2:-0}"
+    local value=""
+
+    # 某些网页终端只会及时刷新“带换行”的输出，所以提示语单独占一行
+    printf '%s\n' "$prompt" >/dev/tty
+    tty_print "> "
+    if [ "$silent" = "1" ]; then
+        IFS= read -r -s value </dev/tty || true
+        tty_print $'\n'
+    else
+        IFS= read -r value </dev/tty || true
+    fi
+    REPLY="$value"
+}
+
+ensure_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "❌ 当前操作需要 root 权限，请切换到 root 后重试。"
+        exit 1
+    fi
+}
+
+detect_pkg_manager() {
+    if has_cmd apt-get; then
+        echo "apt"
+    elif has_cmd dnf; then
+        echo "dnf"
+    elif has_cmd yum; then
+        echo "yum"
+    elif has_cmd apk; then
+        echo "apk"
+    elif has_cmd zypper; then
+        echo "zypper"
+    else
+        echo ""
+    fi
+}
+
+install_openssl() {
+    local pkg_manager
+    pkg_manager="$(detect_pkg_manager)"
+
+    if [ -z "$pkg_manager" ]; then
+        echo "❌ 未找到支持的包管理器，无法自动安装 openssl，请手动安装后重试。"
+        exit 1
     fi
 
-    # 2. 强行终止后台的 Hysteria2 进程
-    echo "🛑 正在停止 Hysteria2 后台运行进程..."
-    # 即使进程不存在也忽略报错，继续往下执行
-    pkill -f "hysteria-linux" || echo "   未发现运行中的进程，跳过。"
+    ensure_root
+    echo "📦 检测到未安装 openssl，尝试自动安装（$pkg_manager）..."
 
-    # 3. 撤销防火墙放行规则（做到不留痕迹）
-    if [ -n "$old_port" ]; then
-        echo "🛡️ 正在撤销防火墙放行规则 (端口: $old_port)..."
-        if command -v iptables &> /dev/null; then
-            # -D 代表 Delete (删除) 规则，2>/dev/null 屏蔽找不到规则时的报错
-            iptables -D INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null || true
-            iptables -D OUTPUT -p udp --sport "$old_port" -j ACCEPT 2>/dev/null || true
+    case "$pkg_manager" in
+        apt)
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y openssl
+            ;;
+        dnf)
+            dnf install -y openssl
+            ;;
+        yum)
+            yum install -y openssl
+            ;;
+        apk)
+            apk add --no-cache openssl
+            ;;
+        zypper)
+            zypper --non-interactive install openssl
+            ;;
+    esac
+
+    if has_cmd openssl; then
+        echo "✅ openssl 安装完成。"
+    else
+        echo "❌ openssl 安装失败，请手动安装后重试。"
+        exit 1
+    fi
+}
+
+ensure_openssl() {
+    if has_cmd openssl; then
+        return
+    fi
+    install_openssl
+}
+
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
+}
+
+read_text() {
+    local prompt="$1"
+    local default_value="${2:-}"
+
+    if [ -n "$default_value" ]; then
+        tty_prompt_read "$prompt [$default_value]"
+        REPLY="${REPLY:-$default_value}"
+    else
+        tty_prompt_read "$prompt"
+    fi
+}
+
+read_secret() {
+    local prompt="$1"
+    local default_value="${2:-}"
+
+    if [ -n "$default_value" ]; then
+        tty_prompt_read "$prompt [已有值，回车保持]" "1"
+        REPLY="${REPLY:-$default_value}"
+    else
+        tty_prompt_read "$prompt" "1"
+    fi
+}
+
+read_yes_no() {
+    local prompt="$1"
+    local default_value="${2:-y}"
+    local value
+    local hint
+
+    if [ "$default_value" = "y" ]; then
+        hint="Y/n"
+    else
+        hint="y/N"
+    fi
+
+    while true; do
+        tty_prompt_read "$prompt [$hint]"
+        value="${REPLY:-$default_value}"
+        case "$value" in
+            y|Y|yes|YES|Yes)
+                REPLY="y"
+                return 0
+                ;;
+            n|N|no|NO|No)
+                REPLY="n"
+                return 0
+                ;;
+            *)
+                echo "⚠️  请输入 y 或 n"
+                ;;
+        esac
+    done
+}
+
+ask_port() {
+    local prompt="$1"
+    local default_value="$2"
+
+    while true; do
+        read_text "$prompt" "$default_value"
+        if validate_port "$REPLY"; then
+            return 0
         fi
-        if command -v ufw &> /dev/null; then
-            ufw delete allow "$old_port"/udp &> /dev/null || true
+        echo "⚠️  端口必须是 1-65535 之间的数字"
+    done
+}
+
+normalize_mode() {
+    case "${1,,}" in
+        tcp_only|tcp|tcp_proxy_udp_direct|1)
+            echo "tcp_only"
+            ;;
+        all_proxy|all|proxy_all|2)
+            echo "all_proxy"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+mode_text() {
+    case "$MODE" in
+        tcp_only)
+            echo "仅 TCP 走代理，UDP 直连 VPS2"
+            ;;
+        all_proxy)
+            echo "尽量 TCP/UDP 都走代理"
+            ;;
+        *)
+            echo "$MODE"
+            ;;
+    esac
+}
+
+choose_mode() {
+    local value
+    while true; do
+        echo "请选择分流模式："
+        echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
+        echo "2. 尽量 TCP/UDP 都走代理"
+        tty_prompt_read "请输入选项 [1]"
+        value="${REPLY:-1}"
+        MODE="$(normalize_mode "$value")"
+        if [ -n "$MODE" ]; then
+            return 0
+        fi
+        echo "⚠️  请输入 1 或 2"
+    done
+}
+
+list_generated_files() {
+    printf '%s\n' "./server.yaml"
+    printf '%s\n' "./${CERT_FILE}"
+    printf '%s\n' "./${KEY_FILE}"
+    printf '%s\n' "./hysteria-linux-amd64"
+    printf '%s\n' "./hysteria-linux-arm64"
+    printf '%s\n' "./${PID_FILE}"
+    printf '%s\n' "./${LOG_FILE}"
+}
+
+parse_args() {
+    local positional=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            del|--uninstall|uninstall|remove|rm)
+                ACTION="uninstall"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -* )
+                echo "❌ 不支持的参数: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#positional[@]} -ge 1 && -n "${positional[0]}" ]]; then
+        SERVER_PORT="${positional[0]}"
+        echo "✅ 使用命令行指定 Hysteria2 端口: $SERVER_PORT"
+    else
+        SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
+    fi
+
+    if [[ ${#positional[@]} -ge 2 && -n "${positional[1]}" ]]; then
+        SOCKS_IP="${positional[1]}"
+        USE_SOCKS5="y"
+        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 地址: $SOCKS_IP"
+    fi
+
+    if [[ ${#positional[@]} -ge 3 && -n "${positional[2]}" ]]; then
+        SOCKS5_PORT="${positional[2]}"
+        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 端口: $SOCKS5_PORT"
+    fi
+
+    if [[ ${#positional[@]} -ge 4 && -n "${positional[3]}" ]]; then
+        MODE="${positional[3]}"
+        echo "✅ 使用命令行指定模式: $MODE"
+    fi
+
+    if [[ ${#positional[@]} -gt 4 ]]; then
+        echo "❌ 参数过多。"
+        usage
+        exit 1
+    fi
+}
+
+interactive_config() {
+    local default_use_socks="y"
+    local default_auth="n"
+
+    ask_port "请输入 Hysteria2 监听端口" "$SERVER_PORT"
+    SERVER_PORT="$REPLY"
+
+    if [ "$USE_SOCKS5" = "auto" ]; then
+        if [ -n "$SOCKS_IP" ]; then
+            USE_SOCKS5="y"
+        else
+            USE_SOCKS5="n"
         fi
     fi
 
-    # 4. 彻底删除所有相关文件
-    echo "🗑️ 正在删除核心程序及相关配置文件..."
-    rm -f hysteria-linux-*
-    rm -f server.yaml
-    rm -f "$CERT_FILE" "$KEY_FILE"
-    rm -f hy2_run.log
-    
+    if [ "$USE_SOCKS5" = "n" ]; then
+        default_use_socks="n"
+    fi
+
+    read_yes_no "是否使用 AimiliVPN SOCKS5 出站" "$default_use_socks"
+    USE_SOCKS5="$REPLY"
+
+    if [ "$USE_SOCKS5" = "y" ]; then
+        while true; do
+            read_text "请输入 VPS1 的 AimiliVPN SOCKS5 地址(IP或域名)" "$SOCKS_IP"
+            SOCKS_IP="$REPLY"
+            if [ -n "$SOCKS_IP" ]; then
+                break
+            fi
+            echo "⚠️  SOCKS5 地址不能为空"
+        done
+
+        ask_port "请输入 VPS1 的 AimiliVPN SOCKS5 端口" "$SOCKS5_PORT"
+        SOCKS5_PORT="$REPLY"
+
+        if [ -n "$SOCKS5_USER" ] || [ -n "$SOCKS5_PASS" ]; then
+            default_auth="y"
+        fi
+
+        read_yes_no "SOCKS5 是否需要账号密码认证" "$default_auth"
+        if [ "$REPLY" = "y" ]; then
+            while true; do
+                read_text "请输入 SOCKS5 用户名" "$SOCKS5_USER"
+                SOCKS5_USER="$REPLY"
+                if [ -n "$SOCKS5_USER" ]; then
+                    break
+                fi
+                echo "⚠️  用户名不能为空"
+            done
+
+            while true; do
+                read_secret "请输入 SOCKS5 密码" "$SOCKS5_PASS"
+                SOCKS5_PASS="$REPLY"
+                if [ -n "$SOCKS5_PASS" ]; then
+                    break
+                fi
+                echo "⚠️  密码不能为空"
+            done
+        else
+            SOCKS5_USER=""
+            SOCKS5_PASS=""
+        fi
+
+        choose_mode
+    else
+        SOCKS_IP=""
+        SOCKS5_USER=""
+        SOCKS5_PASS=""
+        MODE="tcp_only"
+    fi
+}
+
+validate_config() {
+    if ! validate_port "$SERVER_PORT"; then
+        echo "❌ Hysteria2 监听端口无效: $SERVER_PORT"
+        exit 1
+    fi
+
+    if [ "$USE_SOCKS5" = "y" ]; then
+        if [ -z "$SOCKS_IP" ]; then
+            echo "❌ 已启用 AimiliVPN SOCKS5，但地址为空。"
+            exit 1
+        fi
+
+        if ! validate_port "$SOCKS5_PORT"; then
+            echo "❌ AimiliVPN SOCKS5 端口无效: $SOCKS5_PORT"
+            exit 1
+        fi
+
+        MODE="$(normalize_mode "$MODE")"
+        if [ -z "$MODE" ]; then
+            echo "❌ 模式无效，仅支持: tcp_only 或 all_proxy"
+            exit 1
+        fi
+
+        if { [ -n "$SOCKS5_USER" ] && [ -z "$SOCKS5_PASS" ]; } || { [ -z "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; }; then
+            echo "❌ SOCKS5 用户名和密码必须同时提供，或同时留空。"
+            exit 1
+        fi
+    else
+        SOCKS_IP=""
+        SOCKS5_USER=""
+        SOCKS5_PASS=""
+        MODE="tcp_only"
+    fi
+}
+
+print_summary() {
     echo "=========================================================================="
-    echo "✅ 卸载圆满成功！"
-    echo "所有核心程序、配置文件、自签证书、日志记录以及防火墙规则均已彻底清除。"
-    echo "你的服务器目前已经恢复到安装前的清爽状态。"
+    echo "📋 配置确认:"
+    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
+    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    echo "   🌐 伪装 SNI: $SNI"
+    echo "   🧩 ALPN: $ALPN"
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "   🧦 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
+            echo "   🔐 SOCKS5 认证: 已启用"
+        else
+            echo "   🔓 SOCKS5 认证: 未启用"
+        fi
+        echo "   🚦 分流模式: $(mode_text)"
+    else
+        echo "   🧦 AimiliVPN SOCKS5: 未使用"
+        echo "   🚦 分流模式: 全部直连 VPS2"
+    fi
     echo "=========================================================================="
 }
 
-# ---------- 检查参数并决定执行分支 ----------
-# 如果传入的第一个参数是 del，则执行卸载并直接退出脚本
-if [[ "${1:-}" == "del" ]]; then
-    uninstall_hy2
-    exit 0
-fi
+uninstall_files() {
+    local file
 
-# 如果不是 del，说明用户是想要安装/运行。将参数视作端口号。
-if [[ $# -ge 1 && -n "${1:-}" ]]; then
-    SERVER_PORT="$1"
-    echo "✅ 使用命令行指定端口: $SERVER_PORT"
-else
-    SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
-    echo "⚙️ 未提供端口参数，使用默认端口: $SERVER_PORT"
-fi
+    echo "🗑️  开始卸载 Hysteria2 相关文件..."
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f -- "$PID_FILE"
+    fi
+    pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
 
-# ---------- 以下为原有的安装逻辑 ----------
+    while IFS= read -r file; do
+        if [ -e "$file" ]; then
+            rm -f -- "$file"
+            echo "✅ 已删除: $file"
+        fi
+    done < <(list_generated_files)
 
-# 检测架构
+    echo "✅ 卸载完成。"
+}
+
+start_hysteria() {
+    if [ -f "$PID_FILE" ]; then
+        local old_pid
+        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "⚠️  检测到已有 Hysteria2 正在运行，先停止旧进程: $old_pid"
+            kill "$old_pid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f -- "$PID_FILE"
+    fi
+
+    echo "🚀 正在后台启动 Hysteria2..."
+    nohup "$BIN_PATH" server -c server.yaml >"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 1
+
+    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "✅ Hysteria2 已后台运行"
+        echo "   PID: $(cat "$PID_FILE")"
+        echo "   日志: $(pwd)/${LOG_FILE}"
+    else
+        echo "❌ Hysteria2 启动失败，请检查日志: $(pwd)/${LOG_FILE}"
+        exit 1
+    fi
+}
+
+# ---------- 检测架构 ----------
+# 自动检测 VPS2 的 CPU 架构，以决定下载哪个版本的内核
 arch_name() {
     local machine
-    machine=$(uname -m | tr '[:upper:]' '[:lower:]') 
+    machine=$(uname -m | tr '[:upper:]' '[:lower:]')
     if [[ "$machine" == *"arm64"* ]] || [[ "$machine" == *"aarch64"* ]]; then
         echo "arm64"
     elif [[ "$machine" == *"x86_64"* ]] || [[ "$machine" == *"amd64"* ]]; then
@@ -95,43 +542,54 @@ arch_name() {
     fi
 }
 
-ARCH=$(arch_name)
-if [ -z "$ARCH" ]; then
-  echo "❌ 无法识别 CPU 架构: $(uname -m)"
-  exit 1
-fi
-
-BIN_NAME="hysteria-linux-${ARCH}"
-BIN_PATH="./${BIN_NAME}"
-
-# 下载二进制
 download_binary() {
+    local arch
+    local url
+
+    if ! has_cmd curl; then
+        echo "❌ 未检测到 curl，请先安装 curl 后重试。"
+        exit 1
+    fi
+
+    arch="$(arch_name)"
+    if [ -z "$arch" ]; then
+        echo "❌ 无法识别 CPU 架构: $(uname -m)"
+        exit 1
+    fi
+
+    BIN_NAME="hysteria-linux-${arch}"
+    BIN_PATH="./${BIN_NAME}"
+
     if [ -f "$BIN_PATH" ]; then
         echo "✅ 二进制已存在，跳过下载。"
         return
     fi
-    URL="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
-    echo "⏳ 正在从 Github 下载 Hysteria2 主程序: $URL"
-    curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$URL"
+
+    url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    echo "⏳ 下载: $url"
+    curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"
     chmod +x "$BIN_PATH"
-    echo "✅ 下载完成并已赋予可执行权限: $BIN_PATH"
+    echo "✅ 下载完成并设置可执行: $BIN_PATH"
 }
 
-# 生成证书
+# ---------- 生成证书 ----------
 ensure_cert() {
     if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
-        echo "✅ 发现已有的证书文件，直接使用 cert/key。"
+        echo "✅ 发现证书，使用现有 cert/key。"
         return
     fi
-    echo "🔑 未发现证书，正在调用 openssl 生成自签证书..."
+
+    ensure_openssl
+    echo "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1）..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
     echo "✅ 证书生成成功。"
 }
 
-# 写配置文件
+# ---------- 写配置文件 ----------
 write_config() {
-cat > server.yaml <<EOF
+    {
+        cat <<EOF
 listen: ":${SERVER_PORT}"
 tls:
   cert: "$(pwd)/${CERT_FILE}"
@@ -142,8 +600,8 @@ auth:
   type: "password"
   password: "${AUTH_PASSWORD}"
 bandwidth:
-  up: "200mbps"
-  down: "200mbps"
+  up: "${UP_BANDWIDTH}"
+  down: "${DOWN_BANDWIDTH}"
 quic:
   max_idle_timeout: "10s"
   max_concurrent_streams: 4
@@ -151,72 +609,138 @@ quic:
   max_stream_receive_window: 131072
   initial_conn_receive_window: 131072
   max_conn_receive_window: 262144
+EOF
 
+        if [ "$USE_SOCKS5" = "y" ]; then
+            cat <<EOF
+
+# === AimiliVPN SOCKS5 出站 ===
+outbounds:
+  - name: aimili_socks
+    type: socks5
+    socks5:
+      addr: "${SOCKS_IP}:${SOCKS5_PORT}"
+EOF
+
+            if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
+                cat <<EOF
+      username: "${SOCKS5_USER}"
+      password: "${SOCKS5_PASS}"
+EOF
+            fi
+
+            if [ "$MODE" = "tcp_only" ]; then
+                cat <<'EOF'
+
+# === 分流规则 ===
+# TCP 走 VPS1 的 AimiliVPN SOCKS5，UDP 由 VPS2 直连
+acl:
+  inline:
+    - aimili_socks(network:tcp)
+    - direct(network:udp)
+EOF
+            else
+                cat <<'EOF'
+
+# === 分流规则 ===
+# 尽量全走 VPS1 的 AimiliVPN SOCKS5
+acl:
+  inline:
+    - aimili_socks(all)
+EOF
+            fi
+        else
+            cat <<'EOF'
+
+# === 分流规则 ===
+# 未使用 SOCKS5，全部直连 VPS2
 acl:
   inline:
     - direct(all)
 EOF
+        fi
+    } > server.yaml
+
     echo "✅ 写入配置 server.yaml 成功。"
 }
 
-# 自动开放防火墙端口
-open_firewall() {
-    echo "🛡️ 正在尝试自动配置系统防火墙，放行 UDP 端口: $SERVER_PORT ..."
-    if command -v iptables &> /dev/null; then
-        iptables -I INPUT -p udp --dport "$SERVER_PORT" -j ACCEPT 2>&1
-        iptables -I OUTPUT -p udp --sport "$SERVER_PORT" -j ACCEPT 2>&1
-    fi
-    if command -v ufw &> /dev/null; then
-        ufw allow "$SERVER_PORT"/udp &> /dev/null
-    fi
-    echo "✅ 防火墙放行规则配置尝试完成。"
-}
-
-# 获取服务器 IP
+# ---------- 获取服务器 IP ----------
 get_server_ip() {
-    IP=$(curl -s --max-time 10 https://api.ipify.org || echo "YOUR_SERVER_IP")
-    echo "$IP"
+    local ip
+    ip="$(curl --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    echo "${ip:-YOUR_SERVER_IP}"
 }
 
-# 打印连接信息
+# ---------- 打印连接信息 ----------
 print_connection_info() {
-    local IP="$1"
-    echo "🎉 Hysteria2 配置生成完毕！"
+    local ip="$1"
+
+    echo "🎉 Hysteria2 部署成功！"
     echo "=========================================================================="
     echo "📋 服务器信息:"
-    echo "    🌐 你的面板IP: $IP"
-    echo "    🔌 面板监听端口: $SERVER_PORT"
-    echo "    🔑 连接密码: $AUTH_PASSWORD"
+    echo "   🌐 VPS2 公网IP: $ip"
+    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
+    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "   🧦 VPS1 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
+            echo "   🔐 SOCKS5 认证: 已启用"
+        else
+            echo "   🔓 SOCKS5 认证: 未启用"
+        fi
+        echo "   🚦 分流模式: $(mode_text)"
+    else
+        echo "   🧦 AimiliVPN SOCKS5: 未使用"
+        echo "   🚦 分流模式: 全部直连 VPS2"
+    fi
     echo ""
     echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
-    echo "hysteria2://${AUTH_PASSWORD}@${IP}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-Proxy"
+    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-AimiliVPN"
+    echo ""
+    echo "📝 运行文件:"
+    echo "   📄 配置文件: $(pwd)/server.yaml"
+    echo "   📄 日志文件: $(pwd)/${LOG_FILE}"
+    echo "   📄 PID 文件: $(pwd)/${PID_FILE}"
+    echo ""
+    if [ "$USE_SOCKS5" = "y" ]; then
+        echo "⚠️ 提醒："
+        echo "   1. VPS2 只是接入 VPS1 的 AimiliVPN SOCKS5。"
+        echo "   2. 真正的落地出口 IP 由 VPS1 当前连接的 milivpn/VPNGate 节点决定。"
+        echo "   3. 想换落地 IP，只需要去 VPS1 切 AimiliVPN 的出口节点，不需要改 VPS2。"
+        if [ "$MODE" = "all_proxy" ]; then
+            echo "   4. 当前为尽量全代理模式，UDP 是否稳定取决于上游 SOCKS5 对 UDP 的支持。"
+        else
+            echo "   4. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
+        fi
+    fi
     echo "=========================================================================="
 }
 
-# 主逻辑 (安装模式)
+# ---------- 主逻辑 ----------
 main() {
-    pkill -f "${BIN_NAME}" || true
+    parse_args "$@"
+
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall_files
+        exit 0
+    fi
+
+    if [ -t 0 ]; then
+        interactive_config
+        print_summary
+        read_yes_no "确认以上配置并继续部署" "y"
+        if [ "$REPLY" != "y" ]; then
+            exit 0
+        fi
+    fi
+
+    validate_config
     download_binary
     ensure_cert
     write_config
-    open_firewall
-    
-    SERVER_IP=$(get_server_ip)
+    start_hysteria
+    SERVER_IP="$(get_server_ip)"
     print_connection_info "$SERVER_IP"
-    
-    echo "🚀 正在使用 nohup 将 Hysteria2 送入系统后台默默运行..."
-    nohup "$BIN_PATH" server -c server.yaml > hy2_run.log 2>&1 &
-    
-    sleep 1
-    if ps -ef | grep -v grep | grep -q "${BIN_NAME}"; then
-        echo "🟩 【成功】Hysteria2 已经在后台顺利启动！"
-        echo "📊 实时查看运行日志: tail -f hy2_run.log"
-        echo "💡 现在你可以安全地关闭这个 SSH 终端黑框了。"
-    else
-        echo "🟥 【错误】后台进程未能成功维持运行！"
-        echo "🔍 请立刻运行命令查看日志: cat hy2_run.log"
-    fi
 }
 
-# 因为最上面已经处理过 del 参数了，走到这里的只能是正常的端口号或者空参数
 main "$@"
