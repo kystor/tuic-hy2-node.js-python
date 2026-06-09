@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 自动化部署脚本（已优化：自动放行防火墙 + 默认直连防止中转失效 + 自动后台完全不屏蔽输出运行）
+# Hysteria2 自动化部署脚本（支持一键卸载 del + 自动放行防火墙 + 自动后台完全不屏蔽输出运行）
 # 适用于超低内存环境（32-64MB）
 
 set -e # 遇到错误立刻停止脚本运行，防止产生连锁反应
@@ -16,12 +16,62 @@ ALPN="h3"                   # 应用层协议协商，指定为 HTTP/3 协议
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 自动化部署脚本（支持全自动后台运行）"
-echo "支持命令行端口参数，如：bash hy2.sh 443"
+echo "Hysteria2 自动化部署与清理脚本"
+echo "安装示例：bash hy2.sh 443"
+echo "卸载示例：bash hy2.sh del"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-# ---------- 获取端口 ----------
-# $# 代表传入参数的个数，$1 代表第一个参数
+# ---------- 核心功能：一键卸载 ----------
+uninstall_hy2() {
+    echo "🗑️ 检测到 'del' 参数，开始执行深度卸载与清理..."
+    
+    # 1. 尝试提取原有配置中的端口号（为了清理防火墙）
+    local old_port=""
+    if [ -f "server.yaml" ]; then
+        # 读取 server.yaml 中 listen 后面的端口数字
+        old_port=$(grep -oP 'listen: ":\K\d+' server.yaml || true)
+    fi
+
+    # 2. 强行终止后台的 Hysteria2 进程
+    echo "🛑 正在停止 Hysteria2 后台运行进程..."
+    # 即使进程不存在也忽略报错，继续往下执行
+    pkill -f "hysteria-linux" || echo "   未发现运行中的进程，跳过。"
+
+    # 3. 撤销防火墙放行规则（做到不留痕迹）
+    if [ -n "$old_port" ]; then
+        echo "🛡️ 正在撤销防火墙放行规则 (端口: $old_port)..."
+        if command -v iptables &> /dev/null; then
+            # -D 代表 Delete (删除) 规则，2>/dev/null 屏蔽找不到规则时的报错
+            iptables -D INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null || true
+            iptables -D OUTPUT -p udp --sport "$old_port" -j ACCEPT 2>/dev/null || true
+        fi
+        if command -v ufw &> /dev/null; then
+            ufw delete allow "$old_port"/udp &> /dev/null || true
+        fi
+    fi
+
+    # 4. 彻底删除所有相关文件
+    echo "🗑️ 正在删除核心程序及相关配置文件..."
+    rm -f hysteria-linux-*
+    rm -f server.yaml
+    rm -f "$CERT_FILE" "$KEY_FILE"
+    rm -f hy2_run.log
+    
+    echo "=========================================================================="
+    echo "✅ 卸载圆满成功！"
+    echo "所有核心程序、配置文件、自签证书、日志记录以及防火墙规则均已彻底清除。"
+    echo "你的服务器目前已经恢复到安装前的清爽状态。"
+    echo "=========================================================================="
+}
+
+# ---------- 检查参数并决定执行分支 ----------
+# 如果传入的第一个参数是 del，则执行卸载并直接退出脚本
+if [[ "${1:-}" == "del" ]]; then
+    uninstall_hy2
+    exit 0
+fi
+
+# 如果不是 del，说明用户是想要安装/运行。将参数视作端口号。
 if [[ $# -ge 1 && -n "${1:-}" ]]; then
     SERVER_PORT="$1"
     echo "✅ 使用命令行指定端口: $SERVER_PORT"
@@ -30,11 +80,12 @@ else
     echo "⚙️ 未提供端口参数，使用默认端口: $SERVER_PORT"
 fi
 
-# ---------- 检测架构 ----------
-# 这一步是为了让脚本兼容不同的服务器（比如有的是 AMD/Intel 芯片，有的是 ARM 芯片）
+# ---------- 以下为原有的安装逻辑 ----------
+
+# 检测架构
 arch_name() {
     local machine
-    machine=$(uname -m | tr '[:upper:]' '[:lower:]') # 获取系统架构并全部转为小写
+    machine=$(uname -m | tr '[:upper:]' '[:lower:]') 
     if [[ "$machine" == *"arm64"* ]] || [[ "$machine" == *"aarch64"* ]]; then
         echo "arm64"
     elif [[ "$machine" == *"x86_64"* ]] || [[ "$machine" == *"amd64"* ]]; then
@@ -53,40 +104,33 @@ fi
 BIN_NAME="hysteria-linux-${ARCH}"
 BIN_PATH="./${BIN_NAME}"
 
-# ---------- 下载二进制 ----------
+# 下载二进制
 download_binary() {
-    # 检查当前目录是否已经有下载好的文件，如果有则跳过下载，节省时间
     if [ -f "$BIN_PATH" ]; then
         echo "✅ 二进制已存在，跳过下载。"
         return
     fi
     URL="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
     echo "⏳ 正在从 Github 下载 Hysteria2 主程序: $URL"
-    # curl 不加 -s (静默模式)，这样能在屏幕上清晰看到下载进度条
     curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$URL"
-    
-    # 下载完的程序默认是一块“普通石头”，必须用 chmod +x 赋予它“可执行”的权力
     chmod +x "$BIN_PATH"
     echo "✅ 下载完成并已赋予可执行权限: $BIN_PATH"
 }
 
-# ---------- 生成证书 ----------
+# 生成证书
 ensure_cert() {
     if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
         echo "✅ 发现已有的证书文件，直接使用 cert/key。"
         return
     fi
-    echo "🔑 未发现证书，正在调用 openssl 生成自签证书（prime256v1）..."
-    # 调用系统自带的 openssl 工具生成有效期 3650 天的私钥和公钥，保留输出以供排错
+    echo "🔑 未发现证书，正在调用 openssl 生成自签证书..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
     echo "✅ 证书生成成功。"
 }
 
-# ---------- 写配置文件 ----------
-# 生成运行所需的 server.yaml 文件（核心逻辑都在这里）
+# 写配置文件
 write_config() {
-# 使用 cat <<EOF 将中间的所有内容直接写入到 server.yaml 文件中
 cat > server.yaml <<EOF
 listen: ":${SERVER_PORT}"
 tls:
@@ -108,54 +152,33 @@ quic:
   initial_conn_receive_window: 131072
   max_conn_receive_window: 262144
 
-# === 出站代理配置 (Outbounds) ===
-# 【改动】默认改回直接连接互联网(direct)，防止因为中转服务器失效导致整台节点瘫痪。
-# 如果将来需要重新对接 66.181.36.237 代理，可以取消下方几行的注释：
-# outbounds:
-#   - name: custom_outbound
-#     type: socks5
-#     socks5:
-#       addr: "66.181.36.237:25556"
-
-# === 路由分流规则 (ACL) ===
 acl:
   inline:
-    # 默认让所有流量直连
     - direct(all)
-    # 如果上方启用了 custom_outbound 代理，请把上面一行删掉，并取消下方注释：
-    # - custom_outbound(all)
 EOF
     echo "✅ 写入配置 server.yaml 成功。"
-    echo "   配置详情: 端口=${SERVER_PORT}, SNI=${SNI}, 当前模式=直接出站(直连)"
 }
 
-# ---------- 自动开放防火墙端口 ----------
-# 【新增功能】全自动尝试调用系统防火墙工具，放行对应的 UDP 端口，避免手动漏配
+# 自动开放防火墙端口
 open_firewall() {
     echo "🛡️ 正在尝试自动配置系统防火墙，放行 UDP 端口: $SERVER_PORT ..."
-    
-    # 检查并配置 iptables 防火墙
     if command -v iptables &> /dev/null; then
         iptables -I INPUT -p udp --dport "$SERVER_PORT" -j ACCEPT 2>&1
         iptables -I OUTPUT -p udp --sport "$SERVER_PORT" -j ACCEPT 2>&1
     fi
-    
-    # 检查并配置 ufw 防火墙 (Ubuntu/Debian 常用)
     if command -v ufw &> /dev/null; then
         ufw allow "$SERVER_PORT"/udp &> /dev/null
     fi
-    
     echo "✅ 防火墙放行规则配置尝试完成。"
 }
 
-# ---------- 获取服务器 IP ----------
+# 获取服务器 IP
 get_server_ip() {
-    # 尝试访问 ipify 接口获取本机公网 IP。如果网络超时，默认返回一段提示文字
     IP=$(curl -s --max-time 10 https://api.ipify.org || echo "YOUR_SERVER_IP")
     echo "$IP"
 }
 
-# ---------- 打印连接信息 ----------
+# 打印连接信息
 print_connection_info() {
     local IP="$1"
     echo "🎉 Hysteria2 配置生成完毕！"
@@ -170,35 +193,30 @@ print_connection_info() {
     echo "=========================================================================="
 }
 
-# ---------- 主逻辑 ----------
+# 主逻辑 (安装模式)
 main() {
-    # 先行清理可能存在的旧程序进程，防止端口冲突占用
     pkill -f "${BIN_NAME}" || true
-    
     download_binary
     ensure_cert
     write_config
-    open_firewall   # 执行新增的防火墙放行逻辑
+    open_firewall
     
     SERVER_IP=$(get_server_ip)
     print_connection_info "$SERVER_IP"
     
     echo "🚀 正在使用 nohup 将 Hysteria2 送入系统后台默默运行..."
-    # 【核心改动】移除 exec，改用 nohup 配合 & 进行后台不挂断运行
-    # 2>&1 确保子进程的所有标准输出和错误输出都完整保存到 hy2_run.log 中，绝不隐藏屏蔽
     nohup "$BIN_PATH" server -c server.yaml > hy2_run.log 2>&1 &
     
-    # 稍微等待 1 秒钟，让子进程飞一会儿，然后检查它是否成功存活
     sleep 1
     if ps -ef | grep -v grep | grep -q "${BIN_NAME}"; then
         echo "🟩 【成功】Hysteria2 已经在后台顺利启动！"
-        echo "📊 你可以使用此命令实时查看子进程的完整输出日志: tail -f hy2_run.log"
-        echo "🛑 如果以后需要彻底停止该节点服务，请运行命令: pkill -f hysteria"
-        echo "💡 现在你可以安全地关闭这个 SSH 终端黑框了，后台程序不会受到任何影响。"
+        echo "📊 实时查看运行日志: tail -f hy2_run.log"
+        echo "💡 现在你可以安全地关闭这个 SSH 终端黑框了。"
     else
         echo "🟥 【错误】后台进程未能成功维持运行！"
-        echo "🔍 请立刻运行命令查看日志中的子进程报错输出: cat hy2_run.log"
+        echo "🔍 请立刻运行命令查看日志: cat hy2_run.log"
     fi
 }
 
+# 因为最上面已经处理过 del 参数了，走到这里的只能是正常的端口号或者空参数
 main "$@"
