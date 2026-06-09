@@ -73,6 +73,26 @@ tty_read() {
     read "$@" </dev/tty
 }
 
+tty_print() {
+    printf '%s' "$1" >/dev/tty
+}
+
+tty_prompt_read() {
+    local prompt="$1"
+    local silent="${2:-0}"
+    local value=""
+
+    # 直接写到 /dev/tty，避免 read -p 走 stderr 后在网页终端里延迟显示
+    tty_print "$prompt"
+    if [ "$silent" = "1" ]; then
+        IFS= read -r -s value </dev/tty || true
+        tty_print $'\n'
+    else
+        IFS= read -r value </dev/tty || true
+    fi
+    REPLY="$value"
+}
+
 ensure_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "❌ 当前操作需要 root 权限，请切换到 root 后重试。"
@@ -153,30 +173,24 @@ validate_port() {
 read_text() {
     local prompt="$1"
     local default_value="${2:-}"
-    local value
 
     if [ -n "$default_value" ]; then
-        tty_read -r -p "$prompt [$default_value]: " value || true
-        REPLY="${value:-$default_value}"
+        tty_prompt_read "$prompt [$default_value]: "
+        REPLY="${REPLY:-$default_value}"
     else
-        tty_read -r -p "$prompt: " value || true
-        REPLY="$value"
+        tty_prompt_read "$prompt: "
     fi
 }
 
 read_secret() {
     local prompt="$1"
     local default_value="${2:-}"
-    local value
 
     if [ -n "$default_value" ]; then
-        tty_read -r -s -p "$prompt [已有值，回车保持]: " value || true
-        printf '\n'
-        REPLY="${value:-$default_value}"
+        tty_prompt_read "$prompt [已有值，回车保持]: " "1"
+        REPLY="${REPLY:-$default_value}"
     else
-        tty_read -r -s -p "$prompt: " value || true
-        printf '\n'
-        REPLY="$value"
+        tty_prompt_read "$prompt: " "1"
     fi
 }
 
@@ -193,8 +207,8 @@ read_yes_no() {
     fi
 
     while true; do
-        tty_read -r -p "$prompt [$hint]: " value || true
-        value="${value:-$default_value}"
+        tty_prompt_read "$prompt [$hint]: "
+        value="${REPLY:-$default_value}"
         case "$value" in
             y|Y|yes|YES|Yes)
                 REPLY="y"
@@ -258,8 +272,8 @@ choose_mode() {
         echo "请选择分流模式："
         echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
         echo "2. 尽量 TCP/UDP 都走代理"
-        tty_read -r -p "请输入选项 [1]: " value || true
-        value="${value:-1}"
+        tty_prompt_read "请输入选项 [1]: "
+        value="${REPLY:-1}"
         MODE="$(normalize_mode "$value")"
         if [ -n "$MODE" ]; then
             return 0
