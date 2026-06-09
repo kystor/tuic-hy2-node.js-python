@@ -82,9 +82,8 @@ tty_prompt_read() {
     local silent="${2:-0}"
     local value=""
 
-    # 某些网页终端只会及时刷新“带换行”的输出，所以提示语单独占一行
-    printf '%s\n' "$prompt" >/dev/tty
-    tty_print "> "
+    # 直接写到 /dev/tty，避免 read -p 走 stderr 后在网页终端里延迟显示
+    tty_print "$prompt"
     if [ "$silent" = "1" ]; then
         IFS= read -r -s value </dev/tty || true
         tty_print $'\n'
@@ -176,10 +175,10 @@ read_text() {
     local default_value="${2:-}"
 
     if [ -n "$default_value" ]; then
-        tty_prompt_read "$prompt [$default_value]"
+        tty_prompt_read "$prompt [$default_value]: "
         REPLY="${REPLY:-$default_value}"
     else
-        tty_prompt_read "$prompt"
+        tty_prompt_read "$prompt: "
     fi
 }
 
@@ -188,10 +187,10 @@ read_secret() {
     local default_value="${2:-}"
 
     if [ -n "$default_value" ]; then
-        tty_prompt_read "$prompt [已有值，回车保持]" "1"
+        tty_prompt_read "$prompt [已有值，回车保持]: " "1"
         REPLY="${REPLY:-$default_value}"
     else
-        tty_prompt_read "$prompt" "1"
+        tty_prompt_read "$prompt: " "1"
     fi
 }
 
@@ -208,7 +207,7 @@ read_yes_no() {
     fi
 
     while true; do
-        tty_prompt_read "$prompt [$hint]"
+        tty_prompt_read "$prompt [$hint]: "
         value="${REPLY:-$default_value}"
         case "$value" in
             y|Y|yes|YES|Yes)
@@ -273,7 +272,7 @@ choose_mode() {
         echo "请选择分流模式："
         echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
         echo "2. 尽量 TCP/UDP 都走代理"
-        tty_prompt_read "请输入选项 [1]"
+        tty_prompt_read "请输入选项 [1]: "
         value="${REPLY:-1}"
         MODE="$(normalize_mode "$value")"
         if [ -n "$MODE" ]; then
