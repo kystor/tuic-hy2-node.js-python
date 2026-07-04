@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）
-# 典型链路：客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn 出口
+# Hysteria2 部署脚本（支持 SOCKS5 代理转发）
+# 典型链路：客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-# AimiliVPN SOCKS5 默认习惯
+# SOCKS5 默认配置，兼容旧环境变量名
 SOCKS_IP="${SOCKS_IP:-${AIMILI_SOCKS_IP:-}}"
 SOCKS5_PORT="${SOCKS5_PORT:-${AIMILI_SOCKS5_PORT:-7928}}"
 SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
@@ -30,9 +30,9 @@ LOG_FILE="hysteria.log"
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 部署脚本（专门对接 AimiliVPN SOCKS5）"
-echo "链路: 客户端 -> VPS2(Hysteria2) -> VPS1(AimiliVPN SOCKS5) -> VPNGate/milivpn"
-echo "支持参数: bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]"
+echo "Hysteria2 部署脚本（支持 SOCKS5 代理转发）"
+echo "链路: 客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站"
+echo "支持参数: bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
 usage() {
@@ -40,37 +40,34 @@ usage() {
 用法:
   bash hy2.sh
   bash hy2.sh [监听端口]
-  bash hy2.sh [监听端口] [socksIP]
-  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT]
-  bash hy2.sh [监听端口] [socksIP] [SOCKS5_PORT] [模式]
+  bash hy2.sh [监听端口] [socksIP|local]
+  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT]
+  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]
   bash hy2.sh del
   bash hy2.sh --uninstall
 
 模式:
-  tcp_only   仅 TCP 走代理，UDP 直连 VPS2（推荐，最稳）
+  tcp_only   仅 TCP 走代理，UDP 直连当前服务器（推荐，最稳）
   all_proxy  尽量 TCP/UDP 都走代理（取决于上游 SOCKS5 是否支持 UDP）
 
 示例:
+  bash hy2.sh 443 local 7928
   bash hy2.sh 443 1.2.3.4 7928
   bash hy2.sh 443 1.2.3.4 7928 all_proxy
   SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
   bash hy2.sh del
 
 环境变量:
-  SOCKS_IP / AIMILI_SOCKS_IP
-  SOCKS5_PORT / AIMILI_SOCKS5_PORT
-  SOCKS5_USER / AIMILI_SOCKS5_USER
-  SOCKS5_PASS / AIMILI_SOCKS5_PASS
+  SOCKS_IP
+  SOCKS5_PORT
+  SOCKS5_USER
+  SOCKS5_PASS
   MODE=tcp_only|all_proxy
 EOF
 }
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
-}
-
-tty_read() {
-    read "$@" </dev/tty
 }
 
 tty_print() {
@@ -255,7 +252,7 @@ normalize_mode() {
 mode_text() {
     case "$MODE" in
         tcp_only)
-            echo "仅 TCP 走代理，UDP 直连 VPS2"
+            echo "仅 TCP 走代理，UDP 直连当前服务器"
             ;;
         all_proxy)
             echo "尽量 TCP/UDP 都走代理"
@@ -266,11 +263,30 @@ mode_text() {
     esac
 }
 
+socks_proxy_text() {
+    if [ "$SOCKS_IP" = "127.0.0.1" ]; then
+        echo "本机 SOCKS5 代理: ${SOCKS_IP}:${SOCKS5_PORT}"
+    else
+        echo "远程 SOCKS5 代理: ${SOCKS_IP}:${SOCKS5_PORT}"
+    fi
+}
+
+normalize_socks_host() {
+    case "${1,,}" in
+        local|localhost|127.0.0.1)
+            echo "127.0.0.1"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
 choose_mode() {
     local value
     while true; do
         echo "请选择分流模式："
-        echo "1. 仅 TCP 走代理，UDP 直连 VPS2（推荐）"
+        echo "1. 仅 TCP 走代理，UDP 直连当前服务器（推荐）"
         echo "2. 尽量 TCP/UDP 都走代理"
         tty_prompt_read "请输入选项 [1]: "
         value="${REPLY:-1}"
@@ -329,14 +345,14 @@ parse_args() {
     fi
 
     if [[ ${#positional[@]} -ge 2 && -n "${positional[1]}" ]]; then
-        SOCKS_IP="${positional[1]}"
+        SOCKS_IP="$(normalize_socks_host "${positional[1]}")"
         USE_SOCKS5="y"
-        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 地址: $SOCKS_IP"
+        echo "✅ 使用命令行指定 SOCKS5 代理地址: $SOCKS_IP"
     fi
 
     if [[ ${#positional[@]} -ge 3 && -n "${positional[2]}" ]]; then
         SOCKS5_PORT="${positional[2]}"
-        echo "✅ 使用命令行指定 AimiliVPN SOCKS5 端口: $SOCKS5_PORT"
+        echo "✅ 使用命令行指定 SOCKS5 代理端口: $SOCKS5_PORT"
     fi
 
     if [[ ${#positional[@]} -ge 4 && -n "${positional[3]}" ]]; then
@@ -352,8 +368,9 @@ parse_args() {
 }
 
 interactive_config() {
-    local default_use_socks="y"
     local default_auth="n"
+    local proxy_choice="1"
+    local value
 
     ask_port "请输入 Hysteria2 监听端口" "$SERVER_PORT"
     SERVER_PORT="$REPLY"
@@ -366,24 +383,59 @@ interactive_config() {
         fi
     fi
 
-    if [ "$USE_SOCKS5" = "n" ]; then
-        default_use_socks="n"
+    if [ "$USE_SOCKS5" = "y" ]; then
+        SOCKS_IP="$(normalize_socks_host "$SOCKS_IP")"
+        if [ "$SOCKS_IP" = "127.0.0.1" ]; then
+            proxy_choice="2"
+        else
+            proxy_choice="3"
+        fi
     fi
 
-    read_yes_no "是否使用 AimiliVPN SOCKS5 出站" "$default_use_socks"
-    USE_SOCKS5="$REPLY"
+    while true; do
+        echo "请选择 SOCKS5 代理方式："
+        echo "1. 不使用 SOCKS5 代理，直接连接"
+        echo "2. 使用本机 SOCKS5 代理（127.0.0.1）"
+        echo "3. 使用远程 SOCKS5 代理"
+        tty_prompt_read "请输入选项 [$proxy_choice]: "
+        value="${REPLY:-$proxy_choice}"
+        case "$value" in
+            1|n|N|no|NO|No)
+                USE_SOCKS5="n"
+                SOCKS_IP=""
+                break
+                ;;
+            2|local|localhost|127.0.0.1)
+                USE_SOCKS5="y"
+                SOCKS_IP="127.0.0.1"
+                break
+                ;;
+            3|remote|r|R)
+                USE_SOCKS5="y"
+                if [ "$SOCKS_IP" = "127.0.0.1" ]; then
+                    SOCKS_IP=""
+                fi
+                break
+                ;;
+            *)
+                echo "⚠️  请输入 1、2 或 3"
+                ;;
+        esac
+    done
 
     if [ "$USE_SOCKS5" = "y" ]; then
-        while true; do
-            read_text "请输入 VPS1 的 AimiliVPN SOCKS5 地址(IP或域名)" "$SOCKS_IP"
-            SOCKS_IP="$REPLY"
-            if [ -n "$SOCKS_IP" ]; then
-                break
-            fi
-            echo "⚠️  SOCKS5 地址不能为空"
-        done
+        if [ "$SOCKS_IP" != "127.0.0.1" ]; then
+            while true; do
+                read_text "请输入远程 SOCKS5 代理地址(IP或域名)" "$SOCKS_IP"
+                SOCKS_IP="$(normalize_socks_host "$REPLY")"
+                if [ -n "$SOCKS_IP" ]; then
+                    break
+                fi
+                echo "⚠️  SOCKS5 代理地址不能为空"
+            done
+        fi
 
-        ask_port "请输入 VPS1 的 AimiliVPN SOCKS5 端口" "$SOCKS5_PORT"
+        ask_port "请输入 SOCKS5 代理端口" "$SOCKS5_PORT"
         SOCKS5_PORT="$REPLY"
 
         if [ -n "$SOCKS5_USER" ] || [ -n "$SOCKS5_PASS" ]; then
@@ -430,13 +482,14 @@ validate_config() {
     fi
 
     if [ "$USE_SOCKS5" = "y" ]; then
+        SOCKS_IP="$(normalize_socks_host "$SOCKS_IP")"
         if [ -z "$SOCKS_IP" ]; then
-            echo "❌ 已启用 AimiliVPN SOCKS5，但地址为空。"
+            echo "❌ 已启用 SOCKS5 代理，但地址为空。"
             exit 1
         fi
 
         if ! validate_port "$SOCKS5_PORT"; then
-            echo "❌ AimiliVPN SOCKS5 端口无效: $SOCKS5_PORT"
+            echo "❌ SOCKS5 代理端口无效: $SOCKS5_PORT"
             exit 1
         fi
 
@@ -466,7 +519,7 @@ print_summary() {
     echo "   🌐 伪装 SNI: $SNI"
     echo "   🧩 ALPN: $ALPN"
     if [ "$USE_SOCKS5" = "y" ]; then
-        echo "   🧦 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        echo "   🧦 $(socks_proxy_text)"
         if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
             echo "   🔐 SOCKS5 认证: 已启用"
         else
@@ -474,8 +527,8 @@ print_summary() {
         fi
         echo "   🚦 分流模式: $(mode_text)"
     else
-        echo "   🧦 AimiliVPN SOCKS5: 未使用"
-        echo "   🚦 分流模式: 全部直连 VPS2"
+        echo "   🧦 SOCKS5 代理: 未使用"
+        echo "   🚦 分流模式: 全部直连当前服务器"
     fi
     echo "=========================================================================="
 }
@@ -528,7 +581,7 @@ start_hysteria() {
 }
 
 # ---------- 检测架构 ----------
-# 自动检测 VPS2 的 CPU 架构，以决定下载哪个版本的内核
+# 自动检测当前服务器的 CPU 架构，以决定下载哪个版本的内核
 arch_name() {
     local machine
     machine=$(uname -m | tr '[:upper:]' '[:lower:]')
@@ -613,9 +666,9 @@ EOF
         if [ "$USE_SOCKS5" = "y" ]; then
             cat <<EOF
 
-# === AimiliVPN SOCKS5 出站 ===
+# === SOCKS5 代理出站 ===
 outbounds:
-  - name: aimili_socks
+  - name: socks_proxy
     type: socks5
     socks5:
       addr: "${SOCKS_IP}:${SOCKS5_PORT}"
@@ -632,27 +685,27 @@ EOF
                 cat <<'EOF'
 
 # === 分流规则 ===
-# TCP 走 VPS1 的 AimiliVPN SOCKS5，UDP 由 VPS2 直连
+# TCP 走 SOCKS5 代理，UDP 由当前服务器直连
 acl:
   inline:
-    - aimili_socks(network:tcp)
+    - socks_proxy(network:tcp)
     - direct(network:udp)
 EOF
             else
                 cat <<'EOF'
 
 # === 分流规则 ===
-# 尽量全走 VPS1 的 AimiliVPN SOCKS5
+# 尽量全走 SOCKS5 代理
 acl:
   inline:
-    - aimili_socks(all)
+    - socks_proxy(all)
 EOF
             fi
         else
             cat <<'EOF'
 
 # === 分流规则 ===
-# 未使用 SOCKS5，全部直连 VPS2
+# 未使用 SOCKS5 代理，全部由当前服务器直连
 acl:
   inline:
     - direct(all)
@@ -677,11 +730,11 @@ print_connection_info() {
     echo "🎉 Hysteria2 部署成功！"
     echo "=========================================================================="
     echo "📋 服务器信息:"
-    echo "   🌐 VPS2 公网IP: $ip"
+    echo "   🌐 服务器公网IP: $ip"
     echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
     echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
     if [ "$USE_SOCKS5" = "y" ]; then
-        echo "   🧦 VPS1 AimiliVPN SOCKS5: ${SOCKS_IP}:${SOCKS5_PORT}"
+        echo "   🧦 $(socks_proxy_text)"
         if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
             echo "   🔐 SOCKS5 认证: 已启用"
         else
@@ -689,12 +742,12 @@ print_connection_info() {
         fi
         echo "   🚦 分流模式: $(mode_text)"
     else
-        echo "   🧦 AimiliVPN SOCKS5: 未使用"
-        echo "   🚦 分流模式: 全部直连 VPS2"
+        echo "   🧦 SOCKS5 代理: 未使用"
+        echo "   🚦 分流模式: 全部直连当前服务器"
     fi
     echo ""
     echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
-    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-AimiliVPN"
+    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-SOCKS5"
     echo ""
     echo "📝 运行文件:"
     echo "   📄 配置文件: $(pwd)/server.yaml"
@@ -703,13 +756,12 @@ print_connection_info() {
     echo ""
     if [ "$USE_SOCKS5" = "y" ]; then
         echo "⚠️ 提醒："
-        echo "   1. VPS2 只是接入 VPS1 的 AimiliVPN SOCKS5。"
-        echo "   2. 真正的落地出口 IP 由 VPS1 当前连接的 milivpn/VPNGate 节点决定。"
-        echo "   3. 想换落地 IP，只需要去 VPS1 切 AimiliVPN 的出口节点，不需要改 VPS2。"
+        echo "   1. 已启用 SOCKS5 代理，实际出口取决于该 SOCKS5 代理。"
+        echo "   2. 想换出口 IP，请切换代理背后的出口节点，或更换 SOCKS5 代理地址。"
         if [ "$MODE" = "all_proxy" ]; then
-            echo "   4. 当前为尽量全代理模式，UDP 是否稳定取决于上游 SOCKS5 对 UDP 的支持。"
+            echo "   3. 当前为尽量全代理模式，UDP 是否稳定取决于 SOCKS5 代理对 UDP 的支持。"
         else
-            echo "   4. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
+            echo "   3. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
         fi
     fi
     echo "=========================================================================="
