@@ -8,12 +8,8 @@ set -euo pipefail
 # ---------- 默认配置 ----------
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
 DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
-# Hysteria2 连接密码：由密码管理函数读取或生成
-AUTH_PASSWORD="${AUTH_PASSWORD:-}"
-# UUID 独立保存位置
-AUTH_PASSWORD_FILE="${AUTH_PASSWORD_FILE:-/etc/hysteria2/auth_password}"
-# 是否明确要求重新生成密码
-REGENERATE_PASSWORD=0
+AUTH_PASSWORD="${AUTH_PASSWORD:-}"              # 可通过环境变量指定密码；未指定时自动生成 UUID
+AUTH_FILE="${AUTH_FILE:-hy2-uuid.conf}"         # 独立保存 Hysteria2 密码/UUID 的配置文件
 CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
 KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
 SNI="${SNI:-www.bing.com}"                     # 伪装域名
@@ -40,6 +36,20 @@ echo "链路: 客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站
 echo "支持参数: bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
+# 交互式终端中，脚本正常结束或报错退出时等待按回车，方便查看最后的输出。
+# 非交互式运行（例如自动化任务、管道输入）不会暂停，避免脚本挂住。
+pause_on_exit() {
+    local exit_code=$?
+    trap - EXIT
+    if [ "${HY2_PAUSE_ON_EXIT:-1}" = "1" ] && [ -t 0 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf '\n脚本执行结束（退出码：%s），按回车键退出...' "$exit_code" > /dev/tty
+        IFS= read -r _ </dev/tty || true
+        printf '\n' > /dev/tty
+    fi
+    exit "$exit_code"
+}
+trap pause_on_exit EXIT
+
 usage() {
     cat <<'EOF'
 用法:
@@ -50,7 +60,6 @@ usage() {
   bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]
   bash hy2.sh del
   bash hy2.sh --uninstall
-  bash hy2.sh --regen-password  # 重新生成 UUID 并重新部署
 
 模式:
   tcp_only   仅 TCP 走代理，UDP 直连当前服务器（推荐，最稳）
@@ -64,11 +73,17 @@ usage() {
   bash hy2.sh del
 
 环境变量:
+  AUTH_PASSWORD       可选：自定义 Hysteria2 密码（不设置时自动生成 UUID）
+  AUTH_FILE            密码配置文件路径，默认 ./hy2-uuid.conf
   SOCKS_IP
   SOCKS5_PORT
   SOCKS5_USER
   SOCKS5_PASS
   MODE=tcp_only|all_proxy
+
+密码说明:
+  首次运行会自动生成随机 UUID，并保存到 hy2-uuid.conf；后续运行会复用该密码。
+  卸载时会删除此密码配置文件；如需保留，请在卸载前自行备份。
 EOF
 }
 
@@ -304,6 +319,89 @@ choose_mode() {
     done
 }
 
+# ---------- 生成并持久化 Hysteria2 UUID 密码 ----------
+generate_uuid() {
+    local value=""
+    local raw=""
+    local nibble=""
+    local number=0
+    local variant=0
+
+    # Linux 通常提供内核 UUID 接口，无需额外安装软件。
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        IFS= read -r value < /proc/sys/kernel/random/uuid || true
+    elif has_cmd uuidgen; then
+        value="$(uuidgen 2>/dev/null || true)"
+    else
+        # 兜底方案：使用 OpenSSL 生成随机字节，并设置 UUID v4 的版本/变体位。
+        ensure_openssl
+        raw="$(openssl rand -hex 16)"
+        raw="${raw:0:12}4${raw:13}"
+        nibble="${raw:16:1}"
+        number=$((16#$nibble))
+        variant=$(((number & 3) | 8))
+        raw="${raw:0:16}$(printf '%x' "$variant")${raw:17}"
+        value="${raw:0:8}-${raw:8:4}-${raw:12:4}-${raw:16:4}-${raw:20:12}"
+    fi
+
+    # 统一为小写，并验证 UUID 格式，避免写入意外的空值或错误内容。
+    value="${value,,}"
+    if ! [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo "❌ 无法生成有效 UUID。" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+save_auth_password() {
+    local auth_dir
+    auth_dir="$(dirname -- "$AUTH_FILE")"
+    mkdir -p -- "$auth_dir"
+
+    # 用 umask 保护新建配置文件，并将文件权限收紧为仅当前用户可读写。
+    ( umask 077; printf '%s\n' "$AUTH_PASSWORD" > "$AUTH_FILE" )
+    chmod 600 "$AUTH_FILE" 2>/dev/null || true
+}
+
+auth_file_display_path() {
+    # 将相对路径转换为绝对显示路径，避免输出路径重复拼接。
+    case "$AUTH_FILE" in
+        /*) printf '%s\n' "$AUTH_FILE" ;;
+        *)  printf '%s/%s\n' "$(pwd)" "${AUTH_FILE#./}" ;;
+    esac
+}
+
+load_auth_password() {
+    local saved_password=""
+
+    # 如果调用者显式传入 AUTH_PASSWORD，则以它为准，并同步保存供下次运行复用。
+    if [ -n "$AUTH_PASSWORD" ]; then
+        save_auth_password
+        echo "✅ 使用环境变量 AUTH_PASSWORD 指定的密码，并已保存到：$AUTH_FILE"
+        return 0
+    fi
+
+    # 已有密码文件时，优先读取，确保反复执行脚本不会更换节点密码。
+    if [ -f "$AUTH_FILE" ]; then
+        IFS= read -r saved_password < "$AUTH_FILE" || true
+        if [ -n "$saved_password" ]; then
+            AUTH_PASSWORD="$saved_password"
+            chmod 600 "$AUTH_FILE" 2>/dev/null || true
+            echo "✅ 已从密码配置文件读取现有密码：$AUTH_FILE"
+            return 0
+        fi
+        echo "⚠️ 密码配置文件为空，将重新生成 UUID。"
+    fi
+
+    # 第一次运行或配置文件为空时生成随机 UUID，并写入独立文件。
+    AUTH_PASSWORD="$(generate_uuid)" || {
+        echo "❌ 生成 Hysteria2 UUID 密码失败。" >&2
+        exit 1
+    }
+    save_auth_password
+    echo "✅ 已生成随机 UUID 密码并保存到：$AUTH_FILE"
+}
+
 list_generated_files() {
     printf '%s\n' "./server.yaml"
     printf '%s\n' "./${CERT_FILE}"
@@ -312,83 +410,10 @@ list_generated_files() {
     printf '%s\n' "./hysteria-linux-arm64"
     printf '%s\n' "./${PID_FILE}"
     printf '%s\n' "./${LOG_FILE}"
-}
-
-
-# ---------- Hysteria2 密码持久化 ----------
-
-generate_auth_password() {
-    # 从 Linux 内核读取随机 UUID，不需要安装 uuidgen
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-    else
-        echo "错误：无法读取系统随机 UUID。" >&2
-        return 1
-    fi
-}
-
-save_auth_password() {
-    local password_dir
-    local temp_file
-
-    password_dir="$(dirname "$AUTH_PASSWORD_FILE")"
-
-    # 创建密码目录；权限不足时立即失败
-    mkdir -p "$password_dir"
-
-    # 新文件默认只允许所有者读写
-    umask 077
-    temp_file="$(mktemp "${AUTH_PASSWORD_FILE}.tmp.XXXXXX")"
-
-    # 先写临时文件，再原子替换正式文件
-    if ! printf '%s\n' "$AUTH_PASSWORD" > "$temp_file"; then
-        rm -f -- "$temp_file"
-        echo "错误：写入密码文件失败。" >&2
-        return 1
-    fi
-
-    chmod 600 "$temp_file"
-
-    if ! mv -f -- "$temp_file" "$AUTH_PASSWORD_FILE"; then
-        rm -f -- "$temp_file"
-        echo "错误：保存密码文件失败。" >&2
-        return 1
-    fi
-
-    chmod 600 "$AUTH_PASSWORD_FILE"
-}
-
-ensure_auth_password() {
-    # 情况一：用户明确要求重新生成
-    if [ "$REGENERATE_PASSWORD" = "1" ]; then
-        AUTH_PASSWORD="$(generate_auth_password)"
-        save_auth_password
-        echo "已生成并保存新的 UUID 密码。"
-        return 0
-    fi
-
-    # 情况二：用户通过环境变量手动指定密码
-    if [ -n "$AUTH_PASSWORD" ]; then
-        save_auth_password
-        echo "已保存并使用手动指定的密码。"
-        return 0
-    fi
-
-    # 情况三：已有密码文件，直接复用
-    if [ -s "$AUTH_PASSWORD_FILE" ]; then
-        AUTH_PASSWORD="$(cat "$AUTH_PASSWORD_FILE")"
-
-        # 防止空文件或只有空白字符时误用空密码
-        if [ -n "${AUTH_PASSWORD//[[:space:]]/}" ]; then
-            echo "已读取原有密码，继续复用，不重新生成。"
-            return 0
-        fi
-    fi
-
-    # 情况四：首次运行或密码文件为空，生成新 UUID
-    AUTH_PASSWORD="$(generate_auth_password)"
-    save_auth_password
-    echo "首次运行：已生成并保存新的 UUID 密码。"
+    case "$AUTH_FILE" in
+        /*) printf '%s\n' "$AUTH_FILE" ;;
+        *)  printf '%s\n' "./$AUTH_FILE" ;;
+    esac
 }
 
 parse_args() {
@@ -402,10 +427,6 @@ parse_args() {
                 ;;
             del|--uninstall|uninstall|remove|rm)
                 ACTION="uninstall"
-                shift
-                ;;
-            --regen-password)
-                REGENERATE_PASSWORD=1
                 shift
                 ;;
             --)
@@ -603,6 +624,7 @@ print_summary() {
     echo "📋 配置确认:"
     echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
     echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    echo "   💾 密码保存文件: $AUTH_FILE"
     echo "   🌐 伪装 SNI: $SNI"
     echo "   🧩 ALPN: $ALPN"
     if [ "$USE_SOCKS5" = "y" ]; then
@@ -820,6 +842,7 @@ print_connection_info() {
     echo "   🌐 服务器公网IP: $ip"
     echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
     echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    echo "   💾 密码保存文件: $(auth_file_display_path)"
     if [ "$USE_SOCKS5" = "y" ]; then
         echo "   🧦 $(socks_proxy_text)"
         if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
@@ -863,8 +886,8 @@ main() {
         exit 0
     fi
 
-    # 安装前读取或生成密码，确保服务端和客户端链接一致
-    ensure_auth_password
+    # 在确认配置、生成服务端 YAML 和输出节点链接前，先确定稳定的认证密码。
+    load_auth_password
 
     if [ -t 0 ]; then
         interactive_config
