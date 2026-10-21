@@ -8,7 +8,12 @@ set -euo pipefail
 # ---------- 默认配置 ----------
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
 DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
-AUTH_PASSWORD="${AUTH_PASSWORD:-ieshare2025}"  # Hysteria2 默认连接密码
+# Hysteria2 连接密码：由密码管理函数读取或生成
+AUTH_PASSWORD="${AUTH_PASSWORD:-}"
+# UUID 独立保存位置
+AUTH_PASSWORD_FILE="${AUTH_PASSWORD_FILE:-/etc/hysteria2/auth_password}"
+# 是否明确要求重新生成密码
+REGENERATE_PASSWORD=0
 CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
 KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
 SNI="${SNI:-www.bing.com}"                     # 伪装域名
@@ -45,6 +50,7 @@ usage() {
   bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]
   bash hy2.sh del
   bash hy2.sh --uninstall
+  bash hy2.sh --regen-password  # 重新生成 UUID 并重新部署
 
 模式:
   tcp_only   仅 TCP 走代理，UDP 直连当前服务器（推荐，最稳）
@@ -308,6 +314,83 @@ list_generated_files() {
     printf '%s\n' "./${LOG_FILE}"
 }
 
+
+# ---------- Hysteria2 密码持久化 ----------
+
+generate_auth_password() {
+    # 从 Linux 内核读取随机 UUID，不需要安装 uuidgen
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        echo "错误：无法读取系统随机 UUID。" >&2
+        return 1
+    fi
+}
+
+save_auth_password() {
+    local password_dir
+    local temp_file
+
+    password_dir="$(dirname "$AUTH_PASSWORD_FILE")"
+
+    # 创建密码目录；权限不足时立即失败
+    mkdir -p "$password_dir"
+
+    # 新文件默认只允许所有者读写
+    umask 077
+    temp_file="$(mktemp "${AUTH_PASSWORD_FILE}.tmp.XXXXXX")"
+
+    # 先写临时文件，再原子替换正式文件
+    if ! printf '%s\n' "$AUTH_PASSWORD" > "$temp_file"; then
+        rm -f -- "$temp_file"
+        echo "错误：写入密码文件失败。" >&2
+        return 1
+    fi
+
+    chmod 600 "$temp_file"
+
+    if ! mv -f -- "$temp_file" "$AUTH_PASSWORD_FILE"; then
+        rm -f -- "$temp_file"
+        echo "错误：保存密码文件失败。" >&2
+        return 1
+    fi
+
+    chmod 600 "$AUTH_PASSWORD_FILE"
+}
+
+ensure_auth_password() {
+    # 情况一：用户明确要求重新生成
+    if [ "$REGENERATE_PASSWORD" = "1" ]; then
+        AUTH_PASSWORD="$(generate_auth_password)"
+        save_auth_password
+        echo "已生成并保存新的 UUID 密码。"
+        return 0
+    fi
+
+    # 情况二：用户通过环境变量手动指定密码
+    if [ -n "$AUTH_PASSWORD" ]; then
+        save_auth_password
+        echo "已保存并使用手动指定的密码。"
+        return 0
+    fi
+
+    # 情况三：已有密码文件，直接复用
+    if [ -s "$AUTH_PASSWORD_FILE" ]; then
+        AUTH_PASSWORD="$(cat "$AUTH_PASSWORD_FILE")"
+
+        # 防止空文件或只有空白字符时误用空密码
+        if [ -n "${AUTH_PASSWORD//[[:space:]]/}" ]; then
+            echo "已读取原有密码，继续复用，不重新生成。"
+            return 0
+        fi
+    fi
+
+    # 情况四：首次运行或密码文件为空，生成新 UUID
+    AUTH_PASSWORD="$(generate_auth_password)"
+    save_auth_password
+    echo "首次运行：已生成并保存新的 UUID 密码。"
+}
+
 parse_args() {
     local positional=()
 
@@ -319,6 +402,10 @@ parse_args() {
                 ;;
             del|--uninstall|uninstall|remove|rm)
                 ACTION="uninstall"
+                shift
+                ;;
+            --regen-password)
+                REGENERATE_PASSWORD=1
                 shift
                 ;;
             --)
@@ -775,6 +862,9 @@ main() {
         uninstall_files
         exit 0
     fi
+
+    # 安装前读取或生成密码，确保服务端和客户端链接一致
+    ensure_auth_password
 
     if [ -t 0 ]; then
         interactive_config
