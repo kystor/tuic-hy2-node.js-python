@@ -1,768 +1,330 @@
 #!/usr/bin/env bash
-# -*- coding: utf-8 -*-
-# Hysteria2 部署脚本（支持 SOCKS5 代理转发）
-# 典型链路：客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站
+# Hysteria2 多节点管理脚本
+# 功能：多个 Hysteria2 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 配置、日志和 PID。
+# 代理模式 all_proxy 会尝试让 TCP/UDP 都通过 SOCKS5，实际 UDP 能否正常工作取决于上游 SOCKS5 是否支持 UDP。
 
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 
-# ---------- 默认配置 ----------
+# -------------------- 全局参数（一般无需修改） --------------------
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
-AUTH_PASSWORD="${AUTH_PASSWORD:-}"              # 可通过环境变量指定密码；未指定时自动生成 UUID
-AUTH_FILE="${AUTH_FILE:-hy2-uuid.conf}"         # 独立保存 Hysteria2 密码/UUID 的配置文件
-CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
-KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
-SNI="${SNI:-www.bing.com}"                     # 伪装域名
+SNI="${SNI:-www.bing.com}"
 ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-# SOCKS5 默认配置，兼容旧环境变量名
-SOCKS_IP="${SOCKS_IP:-${AIMILI_SOCKS_IP:-}}"
-SOCKS5_PORT="${SOCKS5_PORT:-${AIMILI_SOCKS5_PORT:-7928}}"
-SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
-SOCKS5_PASS="${SOCKS5_PASS:-${AIMILI_SOCKS5_PASS:-}}"
-MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
-USE_SOCKS5="${USE_SOCKS5:-auto}"
-ACTION="install"
+# 所有文件都放在本脚本所在目录，避免因从不同工作目录运行而写散文件。
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+NODES_DIR="$BASE_DIR/nodes"
+AUTH_FILE="$BASE_DIR/hy2-uuid.conf"
+CERT_FILE="$BASE_DIR/cert.pem"
+KEY_FILE="$BASE_DIR/key.pem"
+
+ARCH=""
+BIN_NAME=""
 BIN_PATH=""
-PID_FILE="hysteria.pid"
-LOG_FILE="hysteria.log"
-# ------------------------------
+NODE_NAME=""
+NODE_DIR=""
+NODE_PORT=""
+USE_SOCKS5="n"
+SOCKS_HOST=""
+SOCKS_PORT="1080"
+SOCKS_USER=""
+SOCKS_PASS=""
+PROXY_MODE="all_proxy"
+AUTH_UUID=""
 
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 部署脚本（支持 SOCKS5 代理转发）"
-echo "链路: 客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站"
-echo "支持参数: bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]"
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-
-# 交互式终端中，脚本正常结束或报错退出时等待按回车，方便查看最后的输出。
-# 非交互式运行（例如自动化任务、管道输入）不会暂停，避免脚本挂住。
-pause_on_exit() {
-    local exit_code=$?
-    trap - EXIT
-    if [ "${HY2_PAUSE_ON_EXIT:-1}" = "1" ] && [ -t 0 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf '\n脚本执行结束（退出码：%s），按回车键退出...' "$exit_code" > /dev/tty
-        IFS= read -r _ </dev/tty || true
-        printf '\n' > /dev/tty
-    fi
-    exit "$exit_code"
-}
-trap pause_on_exit EXIT
-
-usage() {
-    cat <<'EOF'
-用法:
-  bash hy2.sh
-  bash hy2.sh [监听端口]
-  bash hy2.sh [监听端口] [socksIP|local]
-  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT]
-  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]
-  bash hy2.sh del
-  bash hy2.sh --uninstall
-
-模式:
-  tcp_only   仅 TCP 走代理，UDP 直连当前服务器（推荐，最稳）
-  all_proxy  尽量 TCP/UDP 都走代理（取决于上游 SOCKS5 是否支持 UDP）
-
-示例:
-  bash hy2.sh 443 local 7928
-  bash hy2.sh 443 1.2.3.4 7928
-  bash hy2.sh 443 1.2.3.4 7928 all_proxy
-  SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
-  bash hy2.sh del
-
-环境变量:
-  AUTH_PASSWORD       可选：自定义 Hysteria2 密码（不设置时自动生成 UUID）
-  AUTH_FILE            密码配置文件路径，默认 ./hy2-uuid.conf
-  SOCKS_IP
-  SOCKS5_PORT
-  SOCKS5_USER
-  SOCKS5_PASS
-  MODE=tcp_only|all_proxy
-
-密码说明:
-  首次运行会自动生成随机 UUID，并保存到 hy2-uuid.conf；后续运行会复用该密码。
-  卸载时会删除此密码配置文件；如需保留，请在卸载前自行备份。
-EOF
-}
-
-has_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-tty_print() {
-    printf '%s' "$1" >/dev/tty
-}
-
-tty_prompt_read() {
-    local prompt="$1"
-    local silent="${2:-0}"
-    local value=""
-
-    # 直接写到 /dev/tty，避免 read -p 走 stderr 后在网页终端里延迟显示
-    tty_print "$prompt"
-    if [ "$silent" = "1" ]; then
-        IFS= read -r -s value </dev/tty || true
-        tty_print $'\n'
-    else
-        IFS= read -r value </dev/tty || true
-    fi
-    REPLY="$value"
-}
+# -------------------- 通用小工具 --------------------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "❌ 当前操作需要 root 权限，请切换到 root 后重试。"
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "❌ 请使用 root 运行此脚本，例如：sudo bash hy2-multi.sh"
         exit 1
     fi
 }
 
-detect_pkg_manager() {
-    if has_cmd apt-get; then
-        echo "apt"
-    elif has_cmd dnf; then
-        echo "dnf"
-    elif has_cmd yum; then
-        echo "yum"
-    elif has_cmd apk; then
-        echo "apk"
-    elif has_cmd zypper; then
-        echo "zypper"
+pause_enter() {
+    if [[ -t 0 ]]; then
+        read -r -p $'\n按回车键继续...' _ || true
+    fi
+}
+
+read_value() {
+    local prompt="$1" default_value="${2:-}" value=""
+    if [[ -n "$default_value" ]]; then
+        read -r -p "$prompt [$default_value]: " value
+        REPLY="${value:-$default_value}"
     else
-        echo ""
-    fi
-}
-
-install_openssl() {
-    local pkg_manager
-    pkg_manager="$(detect_pkg_manager)"
-
-    if [ -z "$pkg_manager" ]; then
-        echo "❌ 未找到支持的包管理器，无法自动安装 openssl，请手动安装后重试。"
-        exit 1
-    fi
-
-    ensure_root
-    echo "📦 检测到未安装 openssl，尝试自动安装（$pkg_manager）..."
-
-    case "$pkg_manager" in
-        apt)
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y openssl
-            ;;
-        dnf)
-            dnf install -y openssl
-            ;;
-        yum)
-            yum install -y openssl
-            ;;
-        apk)
-            apk add --no-cache openssl
-            ;;
-        zypper)
-            zypper --non-interactive install openssl
-            ;;
-    esac
-
-    if has_cmd openssl; then
-        echo "✅ openssl 安装完成。"
-    else
-        echo "❌ openssl 安装失败，请手动安装后重试。"
-        exit 1
-    fi
-}
-
-ensure_openssl() {
-    if has_cmd openssl; then
-        return
-    fi
-    install_openssl
-}
-
-validate_port() {
-    local port="$1"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        return 1
-    fi
-    return 0
-}
-
-read_text() {
-    local prompt="$1"
-    local default_value="${2:-}"
-
-    if [ -n "$default_value" ]; then
-        tty_prompt_read "$prompt [$default_value]: "
-        REPLY="${REPLY:-$default_value}"
-    else
-        tty_prompt_read "$prompt: "
+        read -r -p "$prompt: " value
+        REPLY="$value"
     fi
 }
 
 read_secret() {
-    local prompt="$1"
-    local default_value="${2:-}"
-
-    if [ -n "$default_value" ]; then
-        tty_prompt_read "$prompt [已有值，回车保持]: " "1"
-        REPLY="${REPLY:-$default_value}"
-    else
-        tty_prompt_read "$prompt: " "1"
-    fi
+    local prompt="$1" value=""
+    read -r -s -p "$prompt: " value
+    printf '\n'
+    REPLY="$value"
 }
 
-read_yes_no() {
-    local prompt="$1"
-    local default_value="${2:-y}"
-    local value
-    local hint
-
-    if [ "$default_value" = "y" ]; then
-        hint="Y/n"
-    else
-        hint="y/N"
-    fi
-
+ask_yes_no() {
+    local prompt="$1" default_value="${2:-n}" value=""
+    local hint="y/N"
+    [[ "$default_value" == "y" ]] && hint="Y/n"
     while true; do
-        tty_prompt_read "$prompt [$hint]: "
-        value="${REPLY:-$default_value}"
-        case "$value" in
-            y|Y|yes|YES|Yes)
-                REPLY="y"
-                return 0
-                ;;
-            n|N|no|NO|No)
-                REPLY="n"
-                return 0
-                ;;
-            *)
-                echo "⚠️  请输入 y 或 n"
-                ;;
+        read -r -p "$prompt [$hint]: " value
+        value="${value:-$default_value}"
+        case "${value,,}" in
+            y|yes) REPLY="y"; return 0 ;;
+            n|no)  REPLY="n"; return 0 ;;
+            *) echo "请输入 y 或 n。" ;;
         esac
     done
 }
 
-ask_port() {
-    local prompt="$1"
-    local default_value="$2"
-
-    while true; do
-        read_text "$prompt" "$default_value"
-        if validate_port "$REPLY"; then
-            return 0
-        fi
-        echo "⚠️  端口必须是 1-65535 之间的数字"
-    done
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
-normalize_mode() {
-    case "${1,,}" in
-        tcp_only|tcp|tcp_proxy_udp_direct|1)
-            echo "tcp_only"
-            ;;
-        all_proxy|all|proxy_all|2)
-            echo "all_proxy"
-            ;;
-        *)
-            echo ""
-            ;;
-    esac
+valid_node_name() {
+    # 只允许安全文件名，防止节点名称影响文件路径。
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
 }
 
-mode_text() {
-    case "$MODE" in
-        tcp_only)
-            echo "仅 TCP 走代理，UDP 直连当前服务器"
-            ;;
-        all_proxy)
-            echo "尽量 TCP/UDP 都走代理"
-            ;;
-        *)
-            echo "$MODE"
-            ;;
-    esac
-}
-
-socks_proxy_text() {
-    if [ "$SOCKS_IP" = "127.0.0.1" ]; then
-        echo "本机 SOCKS5 代理: ${SOCKS_IP}:${SOCKS5_PORT}"
+normalize_host_port() {
+    local host="$1" port="$2"
+    # IPv6 地址需要用方括号包起来，例如 [2001:db8::1]:1080。
+    if [[ "$host" == \[*\] ]]; then
+        printf '%s:%s' "$host" "$port"
+    elif [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
     else
-        echo "远程 SOCKS5 代理: ${SOCKS_IP}:${SOCKS5_PORT}"
+        printf '%s:%s' "$host" "$port"
     fi
 }
 
-normalize_socks_host() {
-    case "${1,,}" in
-        local|localhost|127.0.0.1)
-            echo "127.0.0.1"
-            ;;
-        *)
-            echo "$1"
-            ;;
+yaml_quote() {
+    # 将用户输入转换为 YAML 双引号字符串，转义反斜杠和双引号。
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/\\n}"
+    printf '"%s"' "$value"
+}
+
+# -------------------- 系统依赖、UUID、二进制和证书 --------------------
+install_missing_dependencies() {
+    local missing=()
+    has_cmd curl || missing+=(curl)
+    has_cmd openssl || missing+=(openssl)
+    if (( ${#missing[@]} == 0 )); then return 0; fi
+
+    echo "需要安装依赖：${missing[*]}"
+    if has_cmd apt-get; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    elif has_cmd dnf; then
+        dnf install -y "${missing[@]}"
+    elif has_cmd yum; then
+        yum install -y "${missing[@]}"
+    elif has_cmd apk; then
+        apk add --no-cache "${missing[@]}"
+    elif has_cmd zypper; then
+        zypper --non-interactive install "${missing[@]}"
+    else
+        echo "❌ 找不到受支持的包管理器，请手动安装 curl 和 openssl。" >&2
+        exit 1
+    fi
+}
+
+get_arch() {
+    case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        *) return 1 ;;
     esac
 }
 
-choose_mode() {
-    local value
-    while true; do
-        echo "请选择分流模式："
-        echo "1. 仅 TCP 走代理，UDP 直连当前服务器（推荐）"
-        echo "2. 尽量 TCP/UDP 都走代理"
-        tty_prompt_read "请输入选项 [1]: "
-        value="${REPLY:-1}"
-        MODE="$(normalize_mode "$value")"
-        if [ -n "$MODE" ]; then
-            return 0
-        fi
-        echo "⚠️  请输入 1 或 2"
-    done
-}
-
-# ---------- 生成并持久化 Hysteria2 UUID 密码 ----------
 generate_uuid() {
-    local value=""
-    local raw=""
-    local nibble=""
-    local number=0
-    local variant=0
-
-    # Linux 通常提供内核 UUID 接口，无需额外安装软件。
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        IFS= read -r value < /proc/sys/kernel/random/uuid || true
+    local uuid=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        IFS= read -r uuid < /proc/sys/kernel/random/uuid || true
     elif has_cmd uuidgen; then
-        value="$(uuidgen 2>/dev/null || true)"
+        uuid="$(uuidgen 2>/dev/null || true)"
     else
-        # 兜底方案：使用 OpenSSL 生成随机字节，并设置 UUID v4 的版本/变体位。
-        ensure_openssl
-        raw="$(openssl rand -hex 16)"
-        raw="${raw:0:12}4${raw:13}"
-        nibble="${raw:16:1}"
-        number=$((16#$nibble))
-        variant=$(((number & 3) | 8))
-        raw="${raw:0:16}$(printf '%x' "$variant")${raw:17}"
-        value="${raw:0:8}-${raw:8:4}-${raw:12:4}-${raw:16:4}-${raw:20:12}"
+        uuid="$(openssl rand -hex 16)"
+        uuid="${uuid:0:8}-${uuid:8:4}-4${uuid:13:3}-8${uuid:17:3}-${uuid:20:12}"
     fi
-
-    # 统一为小写，并验证 UUID 格式，避免写入意外的空值或错误内容。
-    value="${value,,}"
-    if ! [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        echo "❌ 无法生成有效 UUID。" >&2
+    uuid="${uuid,,}"
+    [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+        echo "❌ 生成 UUID 失败。" >&2
         return 1
+    }
+    printf '%s\n' "$uuid"
+}
+
+ensure_uuid() {
+    local saved=""
+    mkdir -p "$BASE_DIR"
+    if [[ -f "$AUTH_FILE" ]]; then
+        IFS= read -r saved < "$AUTH_FILE" || true
     fi
-    printf '%s\n' "$value"
-}
-
-save_auth_password() {
-    local auth_dir
-    auth_dir="$(dirname -- "$AUTH_FILE")"
-    mkdir -p -- "$auth_dir"
-
-    # 用 umask 保护新建配置文件，并将文件权限收紧为仅当前用户可读写。
-    ( umask 077; printf '%s\n' "$AUTH_PASSWORD" > "$AUTH_FILE" )
-    chmod 600 "$AUTH_FILE" 2>/dev/null || true
-}
-
-auth_file_display_path() {
-    # 将相对路径转换为绝对显示路径，避免输出路径重复拼接。
-    case "$AUTH_FILE" in
-        /*) printf '%s\n' "$AUTH_FILE" ;;
-        *)  printf '%s/%s\n' "$(pwd)" "${AUTH_FILE#./}" ;;
-    esac
-}
-
-load_auth_password() {
-    local saved_password=""
-
-    # 如果调用者显式传入 AUTH_PASSWORD，则以它为准，并同步保存供下次运行复用。
-    if [ -n "$AUTH_PASSWORD" ]; then
-        save_auth_password
-        echo "✅ 使用环境变量 AUTH_PASSWORD 指定的密码，并已保存到：$AUTH_FILE"
+    # 复用原脚本 hy2-uuid.conf 中已有的 UUID，确保新节点使用统一密码。
+    if [[ "$saved" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        AUTH_UUID="${saved,,}"
+        chmod 600 "$AUTH_FILE" 2>/dev/null || true
         return 0
     fi
-
-    # 已有密码文件时，优先读取，确保反复执行脚本不会更换节点密码。
-    if [ -f "$AUTH_FILE" ]; then
-        IFS= read -r saved_password < "$AUTH_FILE" || true
-        if [ -n "$saved_password" ]; then
-            AUTH_PASSWORD="$saved_password"
-            chmod 600 "$AUTH_FILE" 2>/dev/null || true
-            echo "✅ 已从密码配置文件读取现有密码：$AUTH_FILE"
-            return 0
-        fi
-        echo "⚠️ 密码配置文件为空，将重新生成 UUID。"
+    if [[ -n "$saved" ]]; then
+        cp -a "$AUTH_FILE" "${AUTH_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+        echo "⚠️ 原 hy2-uuid.conf 内容不是 UUID，已备份原文件。"
     fi
+    AUTH_UUID="$(generate_uuid)"
+    printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
+    echo "✅ 已生成公共 UUID，并保存到：$AUTH_FILE"
+}
 
-    # 第一次运行或配置文件为空时生成随机 UUID，并写入独立文件。
-    AUTH_PASSWORD="$(generate_uuid)" || {
-        echo "❌ 生成 Hysteria2 UUID 密码失败。" >&2
+ensure_binary() {
+    ARCH="$(get_arch)" || {
+        echo "❌ 不支持当前 CPU 架构：$(uname -m)" >&2
         exit 1
     }
-    save_auth_password
-    echo "✅ 已生成随机 UUID 密码并保存到：$AUTH_FILE"
-}
+    BIN_NAME="hysteria-linux-${ARCH}"
+    BIN_PATH="$BASE_DIR/$BIN_NAME"
+    if [[ -x "$BIN_PATH" ]]; then return 0; fi
 
-list_generated_files() {
-    printf '%s\n' "./server.yaml"
-    printf '%s\n' "./${CERT_FILE}"
-    printf '%s\n' "./${KEY_FILE}"
-    printf '%s\n' "./hysteria-linux-amd64"
-    printf '%s\n' "./hysteria-linux-arm64"
-    printf '%s\n' "./${PID_FILE}"
-    printf '%s\n' "./${LOG_FILE}"
-    case "$AUTH_FILE" in
-        /*) printf '%s\n' "$AUTH_FILE" ;;
-        *)  printf '%s\n' "./$AUTH_FILE" ;;
-    esac
-}
-
-parse_args() {
-    local positional=()
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            del|--uninstall|uninstall|remove|rm)
-                ACTION="uninstall"
-                shift
-                ;;
-            --)
-                shift
-                break
-                ;;
-            -* )
-                echo "❌ 不支持的参数: $1"
-                usage
-                exit 1
-                ;;
-            *)
-                positional+=("$1")
-                shift
-                ;;
-        esac
-    done
-
-    if [[ ${#positional[@]} -ge 1 && -n "${positional[0]}" ]]; then
-        SERVER_PORT="${positional[0]}"
-        echo "✅ 使用命令行指定 Hysteria2 端口: $SERVER_PORT"
-    else
-        SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
-    fi
-
-    if [[ ${#positional[@]} -ge 2 && -n "${positional[1]}" ]]; then
-        SOCKS_IP="$(normalize_socks_host "${positional[1]}")"
-        USE_SOCKS5="y"
-        echo "✅ 使用命令行指定 SOCKS5 代理地址: $SOCKS_IP"
-    fi
-
-    if [[ ${#positional[@]} -ge 3 && -n "${positional[2]}" ]]; then
-        SOCKS5_PORT="${positional[2]}"
-        echo "✅ 使用命令行指定 SOCKS5 代理端口: $SOCKS5_PORT"
-    fi
-
-    if [[ ${#positional[@]} -ge 4 && -n "${positional[3]}" ]]; then
-        MODE="${positional[3]}"
-        echo "✅ 使用命令行指定模式: $MODE"
-    fi
-
-    if [[ ${#positional[@]} -gt 4 ]]; then
-        echo "❌ 参数过多。"
-        usage
+    local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    local tmp="${BIN_PATH}.download"
+    echo "⏳ 正在下载 Hysteria2 ${HYSTERIA_VERSION}（${ARCH}）..."
+    if ! curl -fL --retry 3 --connect-timeout 30 --output "$tmp" "$url"; then
+        rm -f "$tmp"
+        echo "❌ 下载失败：$url" >&2
         exit 1
     fi
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$BIN_PATH"
+    echo "✅ Hysteria2 内核已准备好：$BIN_PATH"
 }
 
-interactive_config() {
-    local default_auth="n"
-    local proxy_choice="1"
-    local value
-
-    ask_port "请输入 Hysteria2 监听端口" "$SERVER_PORT"
-    SERVER_PORT="$REPLY"
-
-    if [ "$USE_SOCKS5" = "auto" ]; then
-        if [ -n "$SOCKS_IP" ]; then
-            USE_SOCKS5="y"
-        else
-            USE_SOCKS5="n"
-        fi
+ensure_certificate() {
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        chmod 600 "$KEY_FILE" 2>/dev/null || true
+        return 0
     fi
-
-    if [ "$USE_SOCKS5" = "y" ]; then
-        SOCKS_IP="$(normalize_socks_host "$SOCKS_IP")"
-        if [ "$SOCKS_IP" = "127.0.0.1" ]; then
-            proxy_choice="2"
-        else
-            proxy_choice="3"
-        fi
-    fi
-
-    while true; do
-        echo "请选择 SOCKS5 代理方式："
-        echo "1. 不使用 SOCKS5 代理，直接连接"
-        echo "2. 使用本机 SOCKS5 代理（127.0.0.1）"
-        echo "3. 使用远程 SOCKS5 代理"
-        tty_prompt_read "请输入选项 [$proxy_choice]: "
-        value="${REPLY:-$proxy_choice}"
-        case "$value" in
-            1|n|N|no|NO|No)
-                USE_SOCKS5="n"
-                SOCKS_IP=""
-                break
-                ;;
-            2|local|localhost|127.0.0.1)
-                USE_SOCKS5="y"
-                SOCKS_IP="127.0.0.1"
-                break
-                ;;
-            3|remote|r|R)
-                USE_SOCKS5="y"
-                if [ "$SOCKS_IP" = "127.0.0.1" ]; then
-                    SOCKS_IP=""
-                fi
-                break
-                ;;
-            *)
-                echo "⚠️  请输入 1、2 或 3"
-                ;;
-        esac
-    done
-
-    if [ "$USE_SOCKS5" = "y" ]; then
-        if [ "$SOCKS_IP" != "127.0.0.1" ]; then
-            while true; do
-                read_text "请输入远程 SOCKS5 代理地址(IP或域名)" "$SOCKS_IP"
-                SOCKS_IP="$(normalize_socks_host "$REPLY")"
-                if [ -n "$SOCKS_IP" ]; then
-                    break
-                fi
-                echo "⚠️  SOCKS5 代理地址不能为空"
-            done
-        fi
-
-        ask_port "请输入 SOCKS5 代理端口" "$SOCKS5_PORT"
-        SOCKS5_PORT="$REPLY"
-
-        if [ -n "$SOCKS5_USER" ] || [ -n "$SOCKS5_PASS" ]; then
-            default_auth="y"
-        fi
-
-        read_yes_no "SOCKS5 是否需要账号密码认证" "$default_auth"
-        if [ "$REPLY" = "y" ]; then
-            while true; do
-                read_text "请输入 SOCKS5 用户名" "$SOCKS5_USER"
-                SOCKS5_USER="$REPLY"
-                if [ -n "$SOCKS5_USER" ]; then
-                    break
-                fi
-                echo "⚠️  用户名不能为空"
-            done
-
-            while true; do
-                read_secret "请输入 SOCKS5 密码" "$SOCKS5_PASS"
-                SOCKS5_PASS="$REPLY"
-                if [ -n "$SOCKS5_PASS" ]; then
-                    break
-                fi
-                echo "⚠️  密码不能为空"
-            done
-        else
-            SOCKS5_USER=""
-            SOCKS5_PASS=""
-        fi
-
-        choose_mode
-    else
-        SOCKS_IP=""
-        SOCKS5_USER=""
-        SOCKS5_PASS=""
-        MODE="tcp_only"
-    fi
-}
-
-validate_config() {
-    if ! validate_port "$SERVER_PORT"; then
-        echo "❌ Hysteria2 监听端口无效: $SERVER_PORT"
-        exit 1
-    fi
-
-    if [ "$USE_SOCKS5" = "y" ]; then
-        SOCKS_IP="$(normalize_socks_host "$SOCKS_IP")"
-        if [ -z "$SOCKS_IP" ]; then
-            echo "❌ 已启用 SOCKS5 代理，但地址为空。"
-            exit 1
-        fi
-
-        if ! validate_port "$SOCKS5_PORT"; then
-            echo "❌ SOCKS5 代理端口无效: $SOCKS5_PORT"
-            exit 1
-        fi
-
-        MODE="$(normalize_mode "$MODE")"
-        if [ -z "$MODE" ]; then
-            echo "❌ 模式无效，仅支持: tcp_only 或 all_proxy"
-            exit 1
-        fi
-
-        if { [ -n "$SOCKS5_USER" ] && [ -z "$SOCKS5_PASS" ]; } || { [ -z "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; }; then
-            echo "❌ SOCKS5 用户名和密码必须同时提供，或同时留空。"
-            exit 1
-        fi
-    else
-        SOCKS_IP=""
-        SOCKS5_USER=""
-        SOCKS5_PASS=""
-        MODE="tcp_only"
-    fi
-}
-
-print_summary() {
-    echo "=========================================================================="
-    echo "📋 配置确认:"
-    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
-    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
-    echo "   💾 密码保存文件: $AUTH_FILE"
-    echo "   🌐 伪装 SNI: $SNI"
-    echo "   🧩 ALPN: $ALPN"
-    if [ "$USE_SOCKS5" = "y" ]; then
-        echo "   🧦 $(socks_proxy_text)"
-        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
-            echo "   🔐 SOCKS5 认证: 已启用"
-        else
-            echo "   🔓 SOCKS5 认证: 未启用"
-        fi
-        echo "   🚦 分流模式: $(mode_text)"
-    else
-        echo "   🧦 SOCKS5 代理: 未使用"
-        echo "   🚦 分流模式: 全部直连当前服务器"
-    fi
-    echo "=========================================================================="
-}
-
-uninstall_files() {
-    local file
-
-    echo "🗑️  开始卸载 Hysteria2 相关文件..."
-    if [ -f "$PID_FILE" ]; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        rm -f -- "$PID_FILE"
-    fi
-    pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
-
-    while IFS= read -r file; do
-        if [ -e "$file" ]; then
-            rm -f -- "$file"
-            echo "✅ 已删除: $file"
-        fi
-    done < <(list_generated_files)
-
-    echo "✅ 卸载完成。"
-}
-
-start_hysteria() {
-    if [ -f "$PID_FILE" ]; then
-        local old_pid
-        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "⚠️  检测到已有 Hysteria2 正在运行，先停止旧进程: $old_pid"
-            kill "$old_pid" 2>/dev/null || true
-            sleep 1
-        fi
-        rm -f -- "$PID_FILE"
-    fi
-
-    echo "🚀 正在后台启动 Hysteria2..."
-    nohup "$BIN_PATH" server -c server.yaml >"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    sleep 1
-
-    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "✅ Hysteria2 已后台运行"
-        echo "   PID: $(cat "$PID_FILE")"
-        echo "   日志: $(pwd)/${LOG_FILE}"
-    else
-        echo "❌ Hysteria2 启动失败，请检查日志: $(pwd)/${LOG_FILE}"
-        exit 1
-    fi
-}
-
-# ---------- 检测架构 ----------
-# 自动检测当前服务器的 CPU 架构，以决定下载哪个版本的内核
-arch_name() {
-    local machine
-    machine=$(uname -m | tr '[:upper:]' '[:lower:]')
-    if [[ "$machine" == *"arm64"* ]] || [[ "$machine" == *"aarch64"* ]]; then
-        echo "arm64"
-    elif [[ "$machine" == *"x86_64"* ]] || [[ "$machine" == *"amd64"* ]]; then
-        echo "amd64"
-    else
-        echo ""
-    fi
-}
-
-download_binary() {
-    local arch
-    local url
-
-    if ! has_cmd curl; then
-        echo "❌ 未检测到 curl，请先安装 curl 后重试。"
-        exit 1
-    fi
-
-    arch="$(arch_name)"
-    if [ -z "$arch" ]; then
-        echo "❌ 无法识别 CPU 架构: $(uname -m)"
-        exit 1
-    fi
-
-    BIN_NAME="hysteria-linux-${arch}"
-    BIN_PATH="./${BIN_NAME}"
-
-    if [ -f "$BIN_PATH" ]; then
-        echo "✅ 二进制已存在，跳过下载。"
-        return
-    fi
-
-    url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
-    echo "⏳ 下载: $url"
-    curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"
-    chmod +x "$BIN_PATH"
-    echo "✅ 下载完成并设置可执行: $BIN_PATH"
-}
-
-# ---------- 生成证书 ----------
-ensure_cert() {
-    if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
-        echo "✅ 发现证书，使用现有 cert/key。"
-        return
-    fi
-
-    ensure_openssl
-    echo "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1）..."
+    echo "🔐 正在生成共享自签名证书（SNI：$SNI）..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
-    echo "✅ 证书生成成功。"
+        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}" >/dev/null 2>&1
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+    echo "✅ 共享证书已生成。客户端链接会使用 insecure=1。"
 }
 
-# ---------- 写配置文件 ----------
-write_config() {
+ensure_common_files() {
+    ensure_root
+    install_missing_dependencies
+    mkdir -p "$NODES_DIR"
+    ensure_uuid
+    ensure_binary
+    ensure_certificate
+}
+
+# -------------------- 节点配置文件 --------------------
+save_node_meta() {
+    # 用 Bash 的 %q 格式安全保存变量；node.conf 权限为 600。
+    local file="$NODE_DIR/node.conf"
+    mkdir -p "$NODE_DIR"
     {
-        cat <<EOF
-listen: ":${SERVER_PORT}"
-tls:
-  cert: "$(pwd)/${CERT_FILE}"
-  key: "$(pwd)/${KEY_FILE}"
-  alpn:
-    - "${ALPN}"
-auth:
-  type: "password"
-  password: "${AUTH_PASSWORD}"
-bandwidth:
-  up: "${UP_BANDWIDTH}"
-  down: "${DOWN_BANDWIDTH}"
+        printf 'NODE_NAME=%q\n' "$NODE_NAME"
+        printf 'NODE_PORT=%q\n' "$NODE_PORT"
+        printf 'USE_SOCKS5=%q\n' "$USE_SOCKS5"
+        printf 'SOCKS_HOST=%q\n' "$SOCKS_HOST"
+        printf 'SOCKS_PORT=%q\n' "$SOCKS_PORT"
+        printf 'SOCKS_USER=%q\n' "$SOCKS_USER"
+        printf 'SOCKS_PASS=%q\n' "$SOCKS_PASS"
+        printf 'PROXY_MODE=%q\n' "$PROXY_MODE"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+load_node() {
+    local name="$1"
+    if ! valid_node_name "$name"; then
+        echo "❌ 节点名称格式不正确。只允许英文、数字、点、下划线和短横线。" >&2
+        return 1
+    fi
+    NODE_DIR="$NODES_DIR/$name"
+    if [[ ! -f "$NODE_DIR/node.conf" ]]; then
+        echo "❌ 找不到节点：$name" >&2
+        return 1
+    fi
+    # node.conf 由本脚本通过 printf %q 生成，且仅 root 可读写。
+    # shellcheck disable=SC1090
+    source "$NODE_DIR/node.conf"
+    return 0
+}
+
+port_already_managed() {
+    local wanted="$1" conf port
+    shopt -s nullglob
+    for conf in "$NODES_DIR"/*/node.conf; do
+        # 使用子 Shell 读取现有节点端口，避免覆盖当前正在创建的节点变量。
+        port="$( ( unset NODE_PORT; source "$conf"; printf '%s' "${NODE_PORT:-}" ) )"
+        if [[ "$port" == "$wanted" ]]; then
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+port_in_use_by_system() {
+    local port="$1"
+    # Hysteria2 主要监听 UDP；这里同时检查 TCP 和 UDP，避免端口冲突。
+    if has_cmd ss; then
+        ss -H -lntu "sport = :$port" 2>/dev/null | grep . >/dev/null
+    elif has_cmd lsof; then
+        lsof -nP -iTCP:"$port" -iUDP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+choose_port() {
+    local value default_port="${1:-22222}"
+    while true; do
+        read_value "请输入 Hysteria2 监听端口" "$default_port"
+        value="$REPLY"
+        if ! valid_port "$value"; then
+            echo "❌ 端口必须是 1-65535 的整数。"
+            continue
+        fi
+        if port_already_managed "$value"; then
+            echo "❌ 这个端口已经被本脚本的其他节点使用。"
+            continue
+        fi
+        if port_in_use_by_system "$value"; then
+            echo "❌ 检测到端口 $value 已被系统中的其他程序监听。"
+            continue
+        fi
+        NODE_PORT="$value"
+        return 0
+    done
+}
+
+write_node_config() {
+    local yaml_file="$NODE_DIR/server.yaml" addr=""
+    mkdir -p "$NODE_DIR"
+    {
+        printf 'listen: %s\n' "$(yaml_quote ":${NODE_PORT}")"
+        printf 'tls:\n  cert: %s\n  key: %s\n  alpn:\n    - %s\n' \
+            "$(yaml_quote "$CERT_FILE")" "$(yaml_quote "$KEY_FILE")" "$(yaml_quote "$ALPN")"
+        printf 'auth:\n  type: "password"\n  password: %s\n' "$(yaml_quote "$AUTH_UUID")"
+        printf 'bandwidth:\n  up: %s\n  down: %s\n' "$(yaml_quote "$UP_BANDWIDTH")" "$(yaml_quote "$DOWN_BANDWIDTH")"
+        cat <<'YAML'
 quic:
   max_idle_timeout: "10s"
   max_concurrent_streams: 4
@@ -770,141 +332,377 @@ quic:
   max_stream_receive_window: 131072
   initial_conn_receive_window: 131072
   max_conn_receive_window: 262144
-EOF
-
-        if [ "$USE_SOCKS5" = "y" ]; then
-            cat <<EOF
-
-# === SOCKS5 代理出站 ===
+YAML
+        if [[ "$USE_SOCKS5" == "y" ]]; then
+            addr="$(normalize_host_port "$SOCKS_HOST" "$SOCKS_PORT")"
+            cat <<YAML
 outbounds:
   - name: socks_proxy
     type: socks5
     socks5:
-      addr: "${SOCKS_IP}:${SOCKS5_PORT}"
-EOF
-
-            if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
-                cat <<EOF
-      username: "${SOCKS5_USER}"
-      password: "${SOCKS5_PASS}"
-EOF
+      addr: $(yaml_quote "$addr")
+YAML
+            if [[ -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
+                printf '      username: %s\n      password: %s\n' "$(yaml_quote "$SOCKS_USER")" "$(yaml_quote "$SOCKS_PASS")"
             fi
-
-            if [ "$MODE" = "tcp_only" ]; then
-                cat <<'EOF'
-
-# === 分流规则 ===
-# TCP 走 SOCKS5 代理，UDP 由当前服务器直连
-acl:
-  inline:
-    - socks_proxy(network:tcp)
-    - direct(network:udp)
-EOF
-            else
-                cat <<'EOF'
-
-# === 分流规则 ===
-# 尽量全走 SOCKS5 代理
+            if [[ "$PROXY_MODE" == "all_proxy" ]]; then
+                cat <<'YAML'
 acl:
   inline:
     - socks_proxy(all)
-EOF
+YAML
+            else
+                cat <<'YAML'
+acl:
+  inline:
+    - socks_proxy(all, tcp/*)
+    - direct(all)
+YAML
             fi
         else
-            cat <<'EOF'
-
-# === 分流规则 ===
-# 未使用 SOCKS5 代理，全部由当前服务器直连
+            cat <<'YAML'
 acl:
   inline:
     - direct(all)
-EOF
+YAML
         fi
-    } > server.yaml
-
-    echo "✅ 写入配置 server.yaml 成功。"
+    } > "$yaml_file"
+    chmod 600 "$yaml_file"
 }
 
-# ---------- 获取服务器 IP ----------
+# -------------------- 显示信息、节点生命周期 --------------------
 get_server_ip() {
-    local ip
-    ip="$(curl --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    echo "${ip:-YOUR_SERVER_IP}"
+    local ip=""
+    ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    if [[ -z "$ip" ]]; then
+        ip="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+    fi
+    printf '%s' "${ip:-YOUR_SERVER_IP}"
 }
 
-# ---------- 打印连接信息 ----------
-print_connection_info() {
-    local ip="$1"
+print_link() {
+    local ip="$1" url_ip="$1" label="$2"
+    if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
+    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#Hy2-%s\n' \
+        "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$label"
+}
 
-    echo "🎉 Hysteria2 部署成功！"
-    echo "=========================================================================="
-    echo "📋 服务器信息:"
-    echo "   🌐 服务器公网IP: $ip"
-    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
-    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
-    echo "   💾 密码保存文件: $(auth_file_display_path)"
-    if [ "$USE_SOCKS5" = "y" ]; then
-        echo "   🧦 $(socks_proxy_text)"
-        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
-            echo "   🔐 SOCKS5 认证: 已启用"
-        else
-            echo "   🔓 SOCKS5 认证: 未启用"
-        fi
-        echo "   🚦 分流模式: $(mode_text)"
+node_is_running() {
+    local pid="" command_line=""
+    [[ -f "$NODE_DIR/hysteria.pid" ]] || return 1
+    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # 除了确认 PID 存在，还要核对它确实是本节点的 Hysteria 进程，避免 PID 重用后误杀其他程序。
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
     else
-        echo "   🧦 SOCKS5 代理: 未使用"
-        echo "   🚦 分流模式: 全部直连当前服务器"
+        command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
     fi
-    echo ""
-    echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
-    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-SOCKS5"
-    echo ""
-    echo "📝 运行文件:"
-    echo "   📄 配置文件: $(pwd)/server.yaml"
-    echo "   📄 日志文件: $(pwd)/${LOG_FILE}"
-    echo "   📄 PID 文件: $(pwd)/${PID_FILE}"
-    echo ""
-    if [ "$USE_SOCKS5" = "y" ]; then
-        echo "⚠️ 提醒："
-        echo "   1. 已启用 SOCKS5 代理，实际出口取决于该 SOCKS5 代理。"
-        echo "   2. 想换出口 IP，请切换代理背后的出口节点，或更换 SOCKS5 代理地址。"
-        if [ "$MODE" = "all_proxy" ]; then
-            echo "   3. 当前为尽量全代理模式，UDP 是否稳定取决于 SOCKS5 代理对 UDP 的支持。"
-        else
-            echo "   3. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
-        fi
-    fi
-    echo "=========================================================================="
+    [[ "$command_line" == *"$NODE_DIR/server.yaml"* && "$command_line" == *"hysteria"* ]]
 }
 
-# ---------- 主逻辑 ----------
-main() {
-    parse_args "$@"
-
-    if [ "$ACTION" = "uninstall" ]; then
-        uninstall_files
-        exit 0
-    fi
-
-    # 在确认配置、生成服务端 YAML 和输出节点链接前，先确定稳定的认证密码。
-    load_auth_password
-
-    if [ -t 0 ]; then
-        interactive_config
-        print_summary
-        read_yes_no "确认以上配置并继续部署" "y"
-        if [ "$REPLY" != "y" ]; then
-            exit 0
+create_node() {
+    ensure_common_files
+    local name_value="" use_auth="n" mode_value="2" server_ip=""
+    echo ""
+    echo "创建新 Hysteria2 节点"
+    echo "节点名称只能使用英文、数字、点、下划线和短横线，例如 A、B、Tokyo-2。"
+    while true; do
+        read_value "请输入节点名称" "A"
+        name_value="$REPLY"
+        if ! valid_node_name "$name_value"; then
+            echo "❌ 名称不合法，请重新输入。"
+        elif [[ -e "$NODES_DIR/$name_value" ]]; then
+            echo "❌ 这个节点名称已经存在。"
+        else
+            break
         fi
+    done
+    NODE_NAME="$name_value"
+    NODE_DIR="$NODES_DIR/$NODE_NAME"
+    choose_port "22222"
+
+    echo ""
+    echo "请选择这个节点的出站方式："
+    echo "1. 不使用 SOCKS5，直接从本 VPS 出口连接"
+    echo "2. 使用本机 SOCKS5（例如 127.0.0.1:1080）"
+    echo "3. 使用远程 SOCKS5"
+    while true; do
+        read_value "请输入选项" "1"
+        case "$REPLY" in
+            1) USE_SOCKS5="n"; SOCKS_HOST=""; SOCKS_USER=""; SOCKS_PASS=""; break ;;
+            2) USE_SOCKS5="y"; SOCKS_HOST="127.0.0.1"; break ;;
+            3) USE_SOCKS5="y"; read_value "请输入 SOCKS5 地址（IP 或域名；IPv6 可直接填地址）"; SOCKS_HOST="$REPLY"; [[ -n "$SOCKS_HOST" ]] && break; echo "地址不能为空。" ;;
+            *) echo "请输入 1、2 或 3。" ;;
+        esac
+    done
+
+    if [[ "$USE_SOCKS5" == "y" ]]; then
+        if [[ "$SOCKS_HOST" == "127.0.0.1" ]]; then
+            read_value "请输入本机 SOCKS5 端口" "1080"
+        else
+            read_value "请输入 SOCKS5 端口" "1080"
+        fi
+        while ! valid_port "$REPLY"; do
+            echo "❌ 端口必须是 1-65535 的整数。"
+            read_value "请输入 SOCKS5 端口" "1080"
+        done
+        SOCKS_PORT="$REPLY"
+
+        ask_yes_no "SOCKS5 是否需要用户名和密码认证" "n"
+        use_auth="$REPLY"
+        if [[ "$use_auth" == "y" ]]; then
+            while true; do
+                read_value "请输入 SOCKS5 用户名"
+                SOCKS_USER="$REPLY"
+                [[ -n "$SOCKS_USER" ]] && break
+                echo "用户名不能为空。"
+            done
+            while true; do
+                read_secret "请输入 SOCKS5 密码"
+                SOCKS_PASS="$REPLY"
+                [[ -n "$SOCKS_PASS" ]] && break
+                echo "密码不能为空。"
+            done
+        else
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        fi
+
+        echo ""
+        echo "请选择代理分流模式："
+        echo "1. 仅 TCP 走代理，UDP 直连"
+        echo "2. TCP 和 UDP 都尽可能走 SOCKS5（推荐按你的需求选择）"
+        read_value "请输入选项" "2"
+        while [[ "$REPLY" != "1" && "$REPLY" != "2" ]]; do
+            echo "请输入 1 或 2。"
+            read_value "请输入选项" "2"
+        done
+        mode_value="$REPLY"
+        [[ "$mode_value" == "2" ]] && PROXY_MODE="all_proxy" || PROXY_MODE="tcp_only"
+    else
+        SOCKS_PORT="1080"
+        SOCKS_USER=""
+        SOCKS_PASS=""
+        PROXY_MODE="all_proxy"
     fi
 
-    validate_config
-    download_binary
-    ensure_cert
-    write_config
-    start_hysteria
-    SERVER_IP="$(get_server_ip)"
-    print_connection_info "$SERVER_IP"
+    save_node_meta
+    write_node_config
+    echo ""
+    echo "节点配置已生成：$NODE_DIR/server.yaml"
+    echo "端口：$NODE_PORT/UDP"
+    if [[ "$USE_SOCKS5" == "y" ]]; then
+        echo "SOCKS5：$SOCKS_HOST:$SOCKS_PORT"
+        echo "模式：$PROXY_MODE"
+    else
+        echo "出站：直连 VPS"
+    fi
+    ask_yes_no "立即启动这个节点" "y"
+    if [[ "$REPLY" == "y" ]]; then
+        start_node "$NODE_NAME"
+    fi
+    server_ip="$(get_server_ip)"
+    echo ""
+    echo "✅ 节点创建完成。"
+    echo "共享 UUID：$AUTH_UUID"
+    echo "节点链接（客户端需允许不安全证书 insecure=1）："
+    print_link "$server_ip" "$NODE_NAME"
+    echo "⚠️ 请在云厂商防火墙/安全组和 VPS 防火墙中放行 UDP 端口 $NODE_PORT。"
+}
+
+start_node() {
+    local name="$1" pid=""
+    load_node "$name" || return 1
+    if [[ ! -x "$BIN_PATH" ]]; then ensure_common_files; fi
+    if node_is_running; then
+        echo "ℹ️ 节点 $NODE_NAME 已在运行，PID：$(cat "$NODE_DIR/hysteria.pid")"
+        return 0
+    fi
+    rm -f "$NODE_DIR/hysteria.pid"
+    if [[ ! -f "$NODE_DIR/server.yaml" ]]; then
+        AUTH_UUID="$(cat "$AUTH_FILE")"
+        write_node_config
+    fi
+    echo "🚀 正在启动节点 $NODE_NAME（UDP/$NODE_PORT）..."
+    nohup "$BIN_PATH" server -c "$NODE_DIR/server.yaml" > "$NODE_DIR/hysteria.log" 2>&1 </dev/null &
+    pid=$!
+    printf '%s\n' "$pid" > "$NODE_DIR/hysteria.pid"
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "✅ 节点 $NODE_NAME 已启动，PID：$pid"
+        echo "日志：$NODE_DIR/hysteria.log"
+    else
+        rm -f "$NODE_DIR/hysteria.pid"
+        echo "❌ 节点启动失败，请查看日志："
+        tail -n 60 "$NODE_DIR/hysteria.log" 2>/dev/null || true
+        return 1
+    fi
+}
+
+stop_node() {
+    local name="$1" pid="" i
+    load_node "$name" || return 1
+    if ! node_is_running; then
+        rm -f "$NODE_DIR/hysteria.pid"
+        echo "ℹ️ 节点 $NODE_NAME 当前没有运行。"
+        return 0
+    fi
+    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    echo "🛑 正在停止节点 $NODE_NAME（PID：$pid）..."
+    kill "$pid" 2>/dev/null || true
+    for ((i=0; i<10; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$NODE_DIR/hysteria.pid"
+    echo "✅ 节点 $NODE_NAME 已停止。"
+}
+
+restart_node() {
+    local name="$1"
+    stop_node "$name" || return 1
+    start_node "$name"
+}
+
+list_nodes() {
+    local conf name status port proxy mode
+    shopt -s nullglob
+    local files=("$NODES_DIR"/*/node.conf)
+    shopt -u nullglob
+    if (( ${#files[@]} == 0 )); then
+        echo "目前还没有节点，请先选择‘创建新节点’。"
+        return 0
+    fi
+    printf '\n%-18s %-8s %-10s %-12s %-12s\n' '节点名称' '端口/UDP' '运行状态' 'SOCKS5' '模式'
+    printf '%-18s %-8s %-10s %-12s %-12s\n' '------------------' '--------' '----------' '------------' '------------'
+    for conf in "${files[@]}"; do
+        # shellcheck disable=SC1090
+        source "$conf"
+        name="${NODE_NAME:-$(basename "$(dirname "$conf")")}"
+        port="${NODE_PORT:-?}"
+        proxy="否"
+        [[ "${USE_SOCKS5:-n}" == "y" ]] && proxy="${SOCKS_HOST:-?}:${SOCKS_PORT:-?}"
+        mode="${PROXY_MODE:-direct}"
+        if [[ -f "$(dirname "$conf")/hysteria.pid" ]] && kill -0 "$(cat "$(dirname "$conf")/hysteria.pid" 2>/dev/null)" 2>/dev/null; then
+            status="运行中"
+        else
+            status="已停止"
+        fi
+        printf '%-18s %-8s %-10s %-12s %-12s\n' "$name" "$port" "$status" "$proxy" "$mode"
+    done
+    echo ""
+}
+
+ask_node_name() {
+    read_value "请输入节点名称"
+    REPLY="$REPLY"
+}
+
+delete_node() {
+    local name="$1" dir="$NODES_DIR/$1"
+    load_node "$name" || return 1
+    echo "即将删除节点 $NODE_NAME（端口 $NODE_PORT），这不会删除其他节点、公共 UUID 或共享证书。"
+    ask_yes_no "确认删除" "n"
+    [[ "$REPLY" == "y" ]] || { echo "已取消。"; return 0; }
+    stop_node "$name" || true
+    rm -rf -- "$dir"
+    echo "✅ 节点 $name 已删除。"
+}
+
+show_logs() {
+    local name="$1"
+    load_node "$name" || return 1
+    if [[ ! -f "$NODE_DIR/hysteria.log" ]]; then
+        echo "该节点尚无日志文件。"
+        return 0
+    fi
+    echo "显示 $name 的最近日志；按 Ctrl+C 返回菜单。"
+    tail -n 100 -f "$NODE_DIR/hysteria.log"
+}
+
+show_uuid() {
+    ensure_uuid
+    echo "公共 Hysteria2 UUID：$AUTH_UUID"
+    echo "文件：$AUTH_FILE（权限应为 600，请勿公开分享）"
+}
+
+print_help() {
+    cat <<EOF
+Hysteria2 多节点管理脚本
+
+交互式菜单：
+  bash "${BASH_SOURCE[0]}"
+
+命令行模式：
+  bash "${BASH_SOURCE[0]}" create
+  bash "${BASH_SOURCE[0]}" list
+  bash "${BASH_SOURCE[0]}" start <节点名>
+  bash "${BASH_SOURCE[0]}" stop <节点名>
+  bash "${BASH_SOURCE[0]}" restart <节点名>
+  bash "${BASH_SOURCE[0]}" delete <节点名>
+  bash "${BASH_SOURCE[0]}" logs <节点名>
+  bash "${BASH_SOURCE[0]}" uuid
+  bash "${BASH_SOURCE[0]}" help
+
+数据目录：${BASE_DIR}/nodes/<节点名>/
+公共 UUID：${AUTH_FILE}
+公共证书：${CERT_FILE} 和 ${KEY_FILE}
+EOF
+}
+
+menu() {
+    local choice
+    while true; do
+        echo ""
+        echo "===================================================="
+        echo "          Hysteria2 多节点管理脚本"
+        echo "===================================================="
+        echo "1. 创建新节点"
+        echo "2. 查看所有节点"
+        echo "3. 启动指定节点"
+        echo "4. 停止指定节点"
+        echo "5. 重启指定节点"
+        echo "6. 删除指定节点"
+        echo "7. 查看节点日志"
+        echo "8. 查看公共 UUID"
+        echo "9. 退出"
+        read -r -p "请输入选项 [1-9]：" choice
+        case "$choice" in
+            1) create_node; pause_enter ;;
+            2) list_nodes; pause_enter ;;
+            3) ask_node_name; start_node "$REPLY"; pause_enter ;;
+            4) ask_node_name; stop_node "$REPLY"; pause_enter ;;
+            5) ask_node_name; restart_node "$REPLY"; pause_enter ;;
+            6) ask_node_name; delete_node "$REPLY"; pause_enter ;;
+            7) ask_node_name; show_logs "$REPLY"; pause_enter ;;
+            8) show_uuid; pause_enter ;;
+            9|q|Q) exit 0 ;;
+            *) echo "❌ 请输入 1-9 之间的选项。" ;;
+        esac
+    done
+}
+
+main() {
+    local cmd="${1:-menu}"
+    ensure_root
+    case "$cmd" in
+        menu) menu ;;
+        create) create_node ;;
+        list) list_nodes ;;
+        start) [[ $# -ge 2 ]] || { echo "用法：$0 start <节点名>"; exit 2; }; start_node "$2" ;;
+        stop) [[ $# -ge 2 ]] || { echo "用法：$0 stop <节点名>"; exit 2; }; stop_node "$2" ;;
+        restart) [[ $# -ge 2 ]] || { echo "用法：$0 restart <节点名>"; exit 2; }; restart_node "$2" ;;
+        delete|del|rm) [[ $# -ge 2 ]] || { echo "用法：$0 delete <节点名>"; exit 2; }; delete_node "$2" ;;
+        logs) [[ $# -ge 2 ]] || { echo "用法：$0 logs <节点名>"; exit 2; }; show_logs "$2" ;;
+        uuid) show_uuid ;;
+        help|-h|--help) print_help ;;
+        *) echo "❌ 未知命令：$cmd"; print_help; exit 2 ;;
+    esac
 }
 
 main "$@"
