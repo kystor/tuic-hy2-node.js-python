@@ -13,8 +13,20 @@ ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-# 所有文件都放在本脚本所在目录，避免因从不同工作目录运行而写散文件。
-BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# 数据目录选择：
+# 1. 如果脚本是从真实文件运行（例如 bash /root/hy2-multi.sh），默认把数据放在脚本同目录。
+# 2. 如果通过 curl | bash、bash <(curl ...) 等方式运行，BASH_SOURCE 可能指向
+#    /dev/fd 或 /proc/<PID>/fd；这些是临时虚拟路径，不能用 mkdir 创建目录。
+#    此时改用持久目录 /opt/hy2-multi，避免出现 mkdir: cannot create directory '/proc/<PID>'。
+# 3. 用户可通过 HY2_BASE_DIR=/自定义路径 覆盖数据目录。
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "${HY2_BASE_DIR:-}" ]]; then
+    BASE_DIR="$HY2_BASE_DIR"
+elif [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" && "$SCRIPT_SOURCE" != /proc/* && "$SCRIPT_SOURCE" != /dev/fd/* && "$SCRIPT_SOURCE" != /dev/stdin ]]; then
+    BASE_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd -P)"
+else
+    BASE_DIR="/opt/hy2-multi"
+fi
 NODES_DIR="$BASE_DIR/nodes"
 AUTH_FILE="$BASE_DIR/hy2-uuid.conf"
 CERT_FILE="$BASE_DIR/cert.pem"
@@ -706,3 +718,4 @@ main() {
 }
 
 main "$@"
+
