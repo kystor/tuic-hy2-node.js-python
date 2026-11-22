@@ -23,23 +23,21 @@ SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
 
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
-CERT_SHA256_FILE="${CERT_DIR}/server.sha256"
-SERVICE_FILE="/etc/systemd/system/hy2@.service"
-TRAFFIC_SERVICE_FILE="/etc/systemd/system/hy2-traffic-monitor.service"
+# systemd 服务文件本体也放在项目目录中，系统目录仅保留软链接。
+SYSTEMD_DIR="${HY2_HOME}/systemd"
+BACKUP_DIR="${HY2_HOME}/backup"
+SERVICE_FILE="${SYSTEMD_DIR}/hy2@.service"
+TRAFFIC_SERVICE_FILE="${SYSTEMD_DIR}/hy2-traffic-monitor.service"
+SYSTEMD_SERVICE_LINK="/etc/systemd/system/hy2@.service"
+SYSTEMD_TRAFFIC_LINK="/etc/systemd/system/hy2-traffic-monitor.service"
 SERVICE_PREFIX="hy2@"
 TRAFFIC_SERVICE="hy2-traffic-monitor.service"
 SNI_HOST="www.bing.com"
 MIGRATION_FILE="${DATA_DIR}/traffic_migrated_v1"
-# 普通文件启动时更新当前脚本；使用 bash <(curl ...) 时，
-# BASH_SOURCE 指向 /dev/fd 或 /proc 管道，不能作为持久化脚本路径。
+FINGERPRINT_FILE="${CERT_DIR}/fingerprint.sha256"
+# 不论用户通过本地文件还是 bash <(curl ...) 启动，正式脚本始终位于统一目录。
 SOURCE_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-if [[ -n "$SOURCE_SCRIPT_PATH" && -f "$SOURCE_SCRIPT_PATH" &&
-      "$SOURCE_SCRIPT_PATH" != /proc/* && "$SOURCE_SCRIPT_PATH" != /dev/fd/* ]]; then
-    SCRIPT_PATH="$SOURCE_SCRIPT_PATH"
-else
-    # 进程替换启动时，将脚本安装到固定位置，供 sr 快捷命令和 systemd 监控服务调用。
-    SCRIPT_PATH="/usr/local/bin/hy2"
-fi
+SCRIPT_PATH="${HY2_HOME}/scripts/hy2.sh"
 
 # -------------------------- 输出函数 --------------------------
 info()    { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
@@ -237,36 +235,38 @@ create_shared_auth() {
     fi
 }
 
-create_self_signed_cert() {
-    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] && return 0
-    info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
-    mkdir -p "$CERT_DIR"
-    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-        -keyout "$KEY_FILE" -out "$CERT_FILE" \
-        -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1
-    chmod 600 "$KEY_FILE"
-    chmod 644 "$CERT_FILE"
-}
-
-# 计算当前服务器证书的 SHA-256 指纹。
-# 保留 OpenSSL 输出的冒号分隔格式，供 Hysteria2 URI 的 pinSHA256 参数使用。
-ensure_cert_fingerprint() {
-    local fingerprint
-    [[ -s "$CERT_FILE" ]] || {
-        error "TLS 证书不存在，无法计算 SHA-256 指纹。"
+# 计算证书本身的 SHA256 指纹，保存为 64 位小写十六进制字符串。
+# 旧版本已经存在的证书也会重新计算，不会为了增加指纹而重新签发证书。
+update_cert_fingerprint() {
+    local raw fingerprint
+    [[ -s "$CERT_FILE" ]] || { error "证书文件不存在，无法计算指纹。"; return 1; }
+    raw="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null)" || {
+        error "读取 TLS 证书指纹失败。"
         return 1
     }
-
-    fingerprint="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null |
-        sed 's/^[^=]*=//')"
-
-    if [[ ! "$fingerprint" =~ ^([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}$ ]]; then
-        error "TLS 证书指纹计算失败，证书可能已损坏。"
+    fingerprint="$(printf '%s' "$raw" | sed -E 's/^[^=]*=//; s/://g' | tr 'A-F' 'a-f')"
+    if [[ ! "$fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+        error "证书 SHA256 指纹格式异常：${raw}"
         return 1
     fi
+    printf '%s\n' "$fingerprint" > "$FINGERPRINT_FILE"
+    chmod 600 "$FINGERPRINT_FILE"
+}
 
-    printf '%s\n' "$fingerprint" > "$CERT_SHA256_FILE"
-    chmod 600 "$CERT_SHA256_FILE"
+create_self_signed_cert() {
+    mkdir -p "$CERT_DIR"
+    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
+        info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1 || {
+            error "TLS 证书生成失败。"
+            return 1
+        }
+        chmod 600 "$KEY_FILE"
+        chmod 644 "$CERT_FILE"
+    fi
+    update_cert_fingerprint
 }
 
 # -------------------------- systemd 节点模板 --------------------------
@@ -292,6 +292,7 @@ ProtectHome=true
 WantedBy=multi-user.target
 EOF_SERVICE
     chmod 644 "$SERVICE_FILE"
+    ln -sfn "$SERVICE_FILE" "$SYSTEMD_SERVICE_LINK"
     systemctl daemon-reload
 }
 
@@ -304,26 +305,37 @@ systemd_quote() {
 
 # -------------------------- 持久化脚本文件 --------------------------
 ensure_persistent_script() {
-    local tmp
-    # 普通文件启动时，当前脚本已经存在，无需额外下载。
-    [[ -f "$SCRIPT_PATH" && -s "$SCRIPT_PATH" ]] && return 0
+    local tmp=""
+    mkdir -p "${HY2_HOME}/scripts" "$BACKUP_DIR"
+    # 已安装在统一目录中的脚本无需处理。
+    if [[ -f "$SCRIPT_PATH" && -s "$SCRIPT_PATH" ]]; then
+        chmod 755 "$SCRIPT_PATH"
+        return 0
+    fi
 
-    # bash <(curl ...) 启动时，原始脚本来自管道，无法可靠复制当前进程输入流。
-    # 因此首次运行时从固定 Raw 地址下载持久化副本，供快捷命令和 systemd 使用。
-    info "检测到当前通过在线命令启动，正在安装持久化脚本..."
-    tmp="$(mktemp)"
-    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$tmp"; then
-        rm -f "$tmp"
-        error "无法下载持久化脚本。请检查 VPS 网络，或先将脚本保存为普通文件后运行。"
-        return 1
+    info "正在安装持久化管理脚本到 ${SCRIPT_PATH}..."
+    # 如果用户是通过本地脚本启动，优先复制当前运行的脚本，避免意外切换到其他 Fork。
+    if [[ -n "$SOURCE_SCRIPT_PATH" && -f "$SOURCE_SCRIPT_PATH" && "$SOURCE_SCRIPT_PATH" != "$SCRIPT_PATH" ]]; then
+        cp "$SOURCE_SCRIPT_PATH" "$SCRIPT_PATH" || {
+            error "复制当前脚本失败。"
+            return 1
+        }
+    else
+        # bash <(curl ...) 启动时无法直接复制管道内容，从脚本自身配置的 Raw 地址下载。
+        tmp="$(mktemp "${HY2_HOME}/scripts/hy2.sh.tmp.XXXXXX")"
+        if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$tmp"; then
+            rm -f "$tmp"
+            error "无法下载持久化脚本。请检查网络，或保存脚本文件后再运行。"
+            return 1
+        fi
+        if ! bash -n "$tmp"; then
+            rm -f "$tmp"
+            error "下载的脚本语法检查失败，未安装持久化副本。"
+            return 1
+        fi
+        mv -f "$tmp" "$SCRIPT_PATH"
     fi
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        error "下载的脚本语法检查失败，未安装持久化副本。"
-        return 1
-    fi
-    install -m 755 "$tmp" "$SCRIPT_PATH"
-    rm -f "$tmp"
+    chmod 755 "$SCRIPT_PATH"
     ok "持久化脚本已安装：${SCRIPT_PATH}"
 }
 
@@ -333,7 +345,15 @@ install_shortcut() {
     mkdir -p /usr/local/bin
     chmod 755 "$SCRIPT_PATH" 2>/dev/null || true
     ln -sfn "$SCRIPT_PATH" /usr/local/bin/sr
-    chmod 755 /usr/local/bin/sr 2>/dev/null || true
+
+    # 兼容旧版曾创建的 /usr/local/bin/hy2：仅在确认它属于本项目时清理。
+    if [[ -L /usr/local/bin/hy2 ]]; then
+        local legacy_target
+        legacy_target="$(readlink -f /usr/local/bin/hy2 2>/dev/null || true)"
+        [[ "$legacy_target" == "$SCRIPT_PATH" || "$legacy_target" == "${HY2_HOME}/scripts/hy2.sh" ]] && rm -f /usr/local/bin/hy2
+    elif [[ -f /usr/local/bin/hy2 ]] && grep -q 'HY2 轻量化多节点管理脚本' /usr/local/bin/hy2 2>/dev/null; then
+        rm -f /usr/local/bin/hy2
+    fi
     ok "快捷命令已设置：输入 sr 即可打开 HY2 管理菜单。"
 }
 
@@ -662,13 +682,13 @@ ensure_server_addr() {
     fi
 
     echo
-    info "请输入客户端连接 VPS 时使用的公网 IP 或域名。"
+    info "正在自动检测 VPS 公网地址（优先 IPv4，失败后尝试 IPv6）..."
     detected="$(get_public_ip || true)"
     if [[ -n "$detected" ]]; then
-        read -r -p "连接地址 [自动检测：${detected}]（直接回车使用自动检测结果）: " input
-        input="${input:-$detected}"
+        input="$detected"
+        ok "已自动获取连接地址：${detected}"
     else
-        warn "多个公网 IP 查询接口均未成功，请手动输入域名或公网 IP。"
+        warn "所有公网 IP 查询接口均失败，请手动输入域名或公网 IP。"
         read -r -p "连接地址: " input
     fi
     if ! valid_server_addr "$input"; then
@@ -702,16 +722,13 @@ make_share_link() {
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
-    fingerprint="$(read_node_value "$CERT_SHA256_FILE" '')"
-
-    if [[ -z "$fingerprint" ]]; then
-        error "证书 SHA-256 指纹不存在，请重新运行脚本初始化。"
-        return 1
+    fingerprint="$(read_node_value "$FINGERPRINT_FILE" '')"
+    if [[ ! "$fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+        update_cert_fingerprint || return 1
+        fingerprint="$(cat "$FINGERPRINT_FILE")"
     fi
-
-    # 自签名证书不再使用 insecure=1 裸连接；
-    # insecure=0 + pinSHA256 可让客户端固定校验当前服务器证书。
-    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0&pinSHA256=%s#%s' \
+    # 按用户要求保留 insecure=1，同时附加 pinSHA256 证书指纹。
+    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1&pinSHA256=%s#%s' \
         "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$fingerprint" "$encoded_name"
 }
 
@@ -1096,6 +1113,7 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF_MONITOR
     chmod 644 "$TRAFFIC_SERVICE_FILE"
+    ln -sfn "$TRAFFIC_SERVICE_FILE" "$SYSTEMD_TRAFFIC_LINK"
     systemctl daemon-reload
 }
 
@@ -1453,13 +1471,26 @@ EOF_UPDATE_ACL
 change_server_addr() {
     local old_addr="" new_addr=""
     [[ -s "$SERVER_ADDR_FILE" ]] && old_addr="$(cat "$SERVER_ADDR_FILE")"
-    read -r -p "输入新的公网 IP/域名 [当前：${old_addr}]: " new_addr
-    new_addr="${new_addr:-$old_addr}"
-    if ! valid_server_addr "$new_addr"; then error "地址不能为空，也不能包含空格、路径或 URL 参数。"; return 1; fi
+    echo
+    info "正在自动检测 VPS 公网地址（优先 IPv4，失败后尝试 IPv6）..."
+    new_addr="$(get_public_ip || true)"
+    if [[ -z "$new_addr" ]]; then
+        error "所有公网 IP 检测接口均失败。"
+        [[ -n "$old_addr" ]] && warn "已保留原连接地址：${old_addr}"
+        return 1
+    fi
+    if ! valid_server_addr "$new_addr"; then
+        error "检测到的公网地址格式不正确，已保留原地址。"
+        return 1
+    fi
     printf '%s\n' "$new_addr" > "$SERVER_ADDR_FILE"
     chmod 600 "$SERVER_ADDR_FILE"
-    ok "分享链接地址已更新。节点服务本身无需重启。"
-    info "请进入「查看所有节点」重新复制分享链接。"
+    if [[ "$new_addr" == "$old_addr" ]]; then
+        ok "公网 IP 未变化：${new_addr}"
+    else
+        ok "分享链接地址已更新：${old_addr:-（首次设置）} -> ${new_addr}"
+    fi
+    info "节点服务无需重启；重新进入「查看所有节点」即可获得使用新 IP 的链接。"
 }
 
 # -------------------------- 流量管理显示 / 设置 --------------------------
@@ -1623,34 +1654,24 @@ traffic_management_menu() {
 # -------------------------- 在线更新脚本 --------------------------
 update_script() {
     local tmp backup new_file
-
     echo
     info "正在从 GitHub 获取最新脚本..."
     info "更新地址：${SCRIPT_URL}"
 
-    # 进程替换启动时，SCRIPT_PATH 指向 /usr/local/bin/hy2；普通文件启动时，
-    # SCRIPT_PATH 则指向用户当前运行的脚本文件。
-    if [[ -z "$SCRIPT_PATH" || "$SCRIPT_PATH" != /* ]]; then
-        error "无法确定脚本安装路径，已取消更新。"
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    tmp="$(mktemp)"
+    mkdir -p "${HY2_HOME}/scripts" "$BACKUP_DIR"
+    tmp="$(mktemp "${HY2_HOME}/scripts/hy2.sh.download.XXXXXX")"
     if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$tmp"; then
         rm -f "$tmp"
         error "脚本下载失败，当前版本没有发生变化。"
         return 1
     fi
-
-    # 防止 GitHub 返回错误页面或不完整内容时覆盖当前可用脚本。
     if [[ ! -s "$tmp" ]] || ! bash -n "$tmp"; then
         rm -f "$tmp"
         error "新脚本为空或语法检查未通过，已保留当前版本。"
         return 1
     fi
 
-    backup="${SCRIPT_PATH}.bak"
+    backup="${BACKUP_DIR}/hy2.sh.$(date +%Y%m%d_%H%M%S).bak"
     if [[ -f "$SCRIPT_PATH" ]]; then
         cp -a "$SCRIPT_PATH" "$backup" || {
             rm -f "$tmp"
@@ -1659,8 +1680,7 @@ update_script() {
         }
     fi
 
-    # 临时文件与目标文件位于同一目录，mv 可在同一文件系统内原子替换。
-    new_file="${SCRIPT_PATH}.new"
+    new_file="${HY2_HOME}/scripts/hy2.sh.new"
     install -m 755 "$tmp" "$new_file" || {
         rm -f "$tmp" "$new_file"
         error "无法写入新脚本，当前版本没有发生变化。"
@@ -1677,35 +1697,27 @@ update_script() {
     [[ -f "$backup" ]] && echo "旧版本备份：${backup}"
     install_shortcut
 
-    # 流量监控服务执行的是 SCRIPT_PATH；更新后重启，使其加载新版本。
     if systemctl is-enabled --quiet "$TRAFFIC_SERVICE" 2>/dev/null ||
        systemctl is-active --quiet "$TRAFFIC_SERVICE" 2>/dev/null; then
         systemctl restart "$TRAFFIC_SERVICE" >/dev/null 2>&1 ||
-            warn "流量监控服务重启失败，可稍后手动重启。"
+            warn "流量监控服务重启失败，可稍后检查。"
     fi
 
     echo
-    ok "正在自动重新启动管理脚本，以加载刚更新的版本..."
-    sleep 1
-
-    # 用新脚本替换当前管理进程；不会重复启动旧版本菜单。
-    # initialize() 会重新加载配置，并确保快捷命令及流量监控服务使用新版本。
+    info "正在自动切换到新版管理菜单..."
+    # exec 替换当前旧脚本进程；不会再返回旧菜单，也不需要用户手动退出。
     exec /bin/bash "$SCRIPT_PATH"
 }
 
 # -------------------------- 深度卸载 --------------------------
 uninstall_all() {
     local d node_id unit confirm unit_file sr_path sr_target
-    local script_to_remove=""
-    local -a script_files=()
-
     echo
     warn "即将执行 HY2 深度卸载：此操作不可撤销。"
-    echo "将删除本脚本创建的 HY2 节点、核心、证书、密码、流量统计数据、"
-    echo "systemd 服务文件、开机启动链接、sr 快捷命令，以及当前脚本和本脚本的更新备份。"
+    echo "将停止并删除 HY2 节点、核心、证书、密码、流量数据、脚本、备份及项目专属 systemd 文件。"
+    echo "同时删除 sr 快捷入口。"
     echo
-    warn "不会清空整台 VPS 的系统日志、Shell 历史、文件系统日志/快照或服务商记录。"
-    warn "这些记录由操作系统或 VPS 平台管理，无法只针对本脚本安全、完整地逐项清除；强行清空会影响其他服务。"
+    warn "不会清空系统日志、Shell 历史、文件系统日志/快照或服务商记录。"
     warn "脚本没有安装防火墙规则，因此不会改动系统或云厂商防火墙。"
     echo
     read -r -p "确认深度卸载？请输入 DELETE: " confirm
@@ -1714,20 +1726,10 @@ uninstall_all() {
         return 0
     fi
 
-    # 先记下脚本路径。SCRIPT_PATH 是 readlink -f 得到的真实路径，
-    # 只有它确实是持久化普通文件时才会在最后删除，避免误删 /proc、/dev 等路径。
-    if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" && \
-          "$SCRIPT_PATH" != /proc/* && "$SCRIPT_PATH" != /sys/* && \
-          "$SCRIPT_PATH" != /dev/* ]]; then
-        script_to_remove="$SCRIPT_PATH"
-        script_files+=("$script_to_remove" "${script_to_remove}.bak" "${script_to_remove}.new")
-    fi
-
     info "正在停止流量监控服务..."
     systemctl disable --now "$TRAFFIC_SERVICE" >/dev/null 2>&1 || true
 
-    # 先根据 systemd 当前登记的服务单元清理 hy2@ 实例，
-    # 再根据节点目录逐个清理，兼容服务单元状态与目录不一致的情况。
+    # 清理所有 hy2@ 实例，兼容节点目录与 systemd 状态不一致的情况。
     while IFS= read -r unit_file; do
         [[ "$unit_file" == hy2@*.service ]] || continue
         [[ "$unit_file" == "${SERVICE_PREFIX}.service" ]] && continue
@@ -1741,44 +1743,29 @@ uninstall_all() {
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
     done
 
-    info "正在删除 HY2 专属 systemd 文件及启动链接..."
-    rm -f -- "$SERVICE_FILE" "$TRAFFIC_SERVICE_FILE"
-
-    # systemctl disable 通常会删除这些链接；这里再清理本脚本命名空间下残留的链接。
+    info "正在删除 systemd 服务链接..."
+    rm -f -- "$SYSTEMD_SERVICE_LINK" "$SYSTEMD_TRAFFIC_LINK"
     for d in /etc/systemd/system/multi-user.target.wants /etc/systemd/system/network-online.target.wants; do
         [[ -d "$d" ]] || continue
-        for unit_file in "$d"/hy2@*.service "$d"/hy2-traffic-monitor.service; do
-            [[ -e "$unit_file" || -L "$unit_file" ]] || continue
-            rm -f -- "$unit_file"
-        done
+        rm -f -- "$d"/hy2@*.service "$d"/hy2-traffic-monitor.service
     done
-
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed "$TRAFFIC_SERVICE" 'hy2@*.service' >/dev/null 2>&1 || true
 
-    # 仅删除指向当前脚本的 sr 符号链接，避免误删用户自己的同名命令。
-    # 必须在删除 HY2_HOME 和脚本本体之前判断目标，否则链接可能已经变成断链。
+    # 只删除指向本项目脚本的 sr 软链接，不碰用户自己的同名文件。
     sr_path="/usr/local/bin/sr"
     if [[ -L "$sr_path" ]]; then
         sr_target="$(readlink -f "$sr_path" 2>/dev/null || true)"
-        if [[ -n "$script_to_remove" && "$sr_target" == "$script_to_remove" ]]; then
+        if [[ "$sr_target" == "$SCRIPT_PATH" || "$sr_target" == "${HY2_HOME}/scripts/hy2.sh" ]]; then
             rm -f -- "$sr_path"
         fi
     fi
 
-    info "正在删除 HY2 安装目录（包括核心、节点配置、证书、认证信息和流量数据）..."
+    info "正在删除统一安装目录 ${HY2_HOME} ..."
     rm -rf -- "$HY2_HOME"
-
-    # 删除当前正在执行的脚本以及由在线更新功能生成的备份/临时替换文件。
-    # Linux 允许删除正在运行的脚本文件；当前进程退出后该文件即不再有目录项。
-    if ((${#script_files[@]} > 0)); then
-        rm -f -- "${script_files[@]}"
-    fi
-
     ok "HY2 深度卸载完成。"
-    echo "已删除：/opt/hy2、HY2 systemd 服务、sr 快捷命令（若指向本脚本）、当前脚本及其更新备份。"
-    echo "注意：系统日志、Shell 历史、文件系统快照/日志和 VPS 平台记录不属于脚本文件，仍可能保留操作痕迹。"
-    echo "退出后，HY2 本身不再保留可运行文件或配置。"
+    echo "已删除：${HY2_HOME}、HY2 专属 systemd 服务链接及 sr 快捷入口（若指向本项目）。"
+    echo "系统日志、Shell 历史、文件系统快照/日志和 VPS 平台记录不属于本脚本文件，仍可能保留。"
 }
 
 # -------------------------- 初始化 --------------------------
@@ -1786,13 +1773,13 @@ initialize() {
     require_root
     require_systemd
     install_missing_commands
-    mkdir -p "${HY2_HOME}/bin" "$NODES_DIR" "$CERT_DIR" "$DATA_DIR"
-    chmod 700 "$HY2_HOME" "$DATA_DIR"
+    mkdir -p "${HY2_HOME}/bin" "$NODES_DIR" "$CERT_DIR" "$DATA_DIR" \
+        "${HY2_HOME}/scripts" "$SYSTEMD_DIR" "$BACKUP_DIR"
+    chmod 700 "$HY2_HOME" "$DATA_DIR" "$BACKUP_DIR"
     ensure_persistent_script || exit 1
     if [[ ! -x "$HY2_BIN" ]]; then install_or_update_core; fi
     create_shared_auth
     create_self_signed_cert
-    ensure_cert_fingerprint || exit 1
     write_systemd_template
     AUTH_PASS="$(cat "$AUTH_FILE")"
     install_shortcut
@@ -1814,7 +1801,7 @@ show_menu() {
     echo "  6. 重启所有节点"
     echo "  7. 查看节点实时日志"
     echo "  8. 修改 SOCKS5 节点的代理配置"
-    echo "  9. 修改分享链接中的 VPS 地址"
+    echo "  9. 自动检测并更新 VPS 公网 IP"
     echo " 10. 更新 Hysteria 2 核心"
     echo " 11. 在线更新脚本"
     echo " 12. 深度卸载"
