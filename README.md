@@ -8,7 +8,11 @@
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
 ```
-* 安装原版稳定脚本
+* 安装 vless 脚本
+```
+bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/vl.sh | sed 's/\r$//')
+```
+* 安装hy原版稳定脚本
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy.sh | sed 's/\r$//')
 ```
