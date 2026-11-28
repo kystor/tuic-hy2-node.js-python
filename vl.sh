@@ -22,7 +22,7 @@
 # 一、顶部统一配置区
 # ============================================================
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # GitHub Raw 脚本更新地址
 SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/vl.sh"
@@ -66,6 +66,10 @@ LISTEN_PORT="443"
 
 # sing-box 官方 GitHub API
 GITHUB_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+
+# root 用户专用的 acme.sh 安装位置，避免 HOME 环境变量变化导致找不到证书账户。
+ACME_HOME="/root/.acme.sh"
+ACME_BIN="${ACME_HOME}/acme.sh"
 
 
 # ============================================================
@@ -379,7 +383,12 @@ add_node() {
     fi
 
     if ! restart_service; then
-        warn "节点已经写入数据库，但服务未能正常启动。"
+        warn "新节点导致服务启动失败，正在回滚节点数据库和配置。"
+        local rollback_file="${TEMP_DIR}/nodes.rollback"
+        grep -Fvx "${uuid}|${node_name}" "$NODE_FILE" > "$rollback_file" || true
+        mv -f "$rollback_file" "$NODE_FILE"
+        chmod 600 "$NODE_FILE"
+        generate_config >/dev/null 2>&1 || true
         return 1
     fi
 
@@ -462,12 +471,21 @@ delete_node() {
         return 1
     fi
 
+    local backup_file="${TEMP_DIR}/nodes.before-delete"
+    cp -f "$NODE_FILE" "$backup_file"
     mv -f "$temp_file" "$NODE_FILE"
     chmod 600 "$NODE_FILE"
 
     if [[ -s "$NODE_FILE" ]]; then
-        generate_config || return 1
-        restart_service
+        if ! generate_config || ! restart_service; then
+            warn "删除后配置或服务检查失败，正在恢复原节点数据库。"
+            cp -f "$backup_file" "$NODE_FILE"
+            chmod 600 "$NODE_FILE"
+            generate_config >/dev/null 2>&1 || true
+            restart_service >/dev/null 2>&1 || true
+            rm -f "$backup_file"
+            return 1
+        fi
     else
         # 不允许生成空用户配置。
         # 删除最后一个节点时，停止服务并保留空数据库。
@@ -476,6 +494,7 @@ delete_node() {
         warn "所有节点已删除，服务已停止。"
     fi
 
+    rm -f "${TEMP_DIR}/nodes.before-delete"
     success "节点删除完成。"
 }
 
@@ -572,6 +591,16 @@ PY
         return 1
     fi
 
+    # 已安装环境更新核心时，先用新核心检查当前配置。
+    # 检查不通过就保留旧核心，避免更新后服务无法启动。
+    if [[ -s "$CONFIG_FILE" ]]; then
+        if ! "${SINGBOX_BIN}.new" check -c "$CONFIG_FILE"; then
+            err "新版本 sing-box 与当前配置不兼容，取消核心更新。"
+            rm -f "${SINGBOX_BIN}.new"
+            return 1
+        fi
+    fi
+
     mv -f "${SINGBOX_BIN}.new" "$SINGBOX_BIN"
 
     rm -rf "$extract_dir"
@@ -588,49 +617,140 @@ PY
 # ============================================================
 
 install_acme() {
-    if [[ -x "$HOME/.acme.sh/acme.sh" ]]; then
+    # 本脚本要求以 root 运行，因此统一使用 /root/.acme.sh。
+    if [[ -x "$ACME_BIN" ]]; then
+        "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || {
+            err "设置 Let's Encrypt 默认 CA 失败。"
+            return 1
+        }
         return 0
     fi
 
     info "正在安装 acme.sh..."
 
+    # 明确将安装脚本交给 bash 执行，避免依赖当前用户的交互式 Shell。
     if ! curl -fsSL https://get.acme.sh | sh; then
         err "acme.sh 安装失败。"
         return 1
     fi
 
-    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-        err "没有找到 acme.sh 程序。"
+    if [[ ! -x "$ACME_BIN" ]]; then
+        err "没有找到 acme.sh 程序：${ACME_BIN}"
         return 1
     fi
 
-    "$HOME/.acme.sh/acme.sh" \
-        --set-default-ca \
-        --server letsencrypt
+    if ! "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null; then
+        err "设置 Let's Encrypt 为默认 CA 失败。"
+        return 1
+    fi
 
     success "acme.sh 安装完成。"
 }
 
-issue_certificate() {
-    info "准备申请 Let's Encrypt 证书..."
+# 验证本地证书是否属于当前域名，并且至少还有指定秒数的有效期。
+certificate_is_valid() {
+    local min_seconds="${1:-86400}"
 
-    # HTTP-01 standalone 模式需要 TCP 80 空闲。
-    # 不检查 TCP 443，因为证书续期时 VLESS 可能正在运行。
+    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] || return 1
 
-    if ! check_port 80; then
-        err "TCP 80 端口已经被占用。"
-        show_port_process 80
+    openssl x509 -in "$CERT_FILE" -noout -checkend "$min_seconds" >/dev/null 2>&1 || return 1
+
+    # 用 SAN 验证域名；不能只依赖 CN，因为现代证书主要使用 subjectAltName。
+    openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null |
+        tr ',' '\n' |
+        sed -E 's/^[[:space:]]*DNS://; s/^[[:space:]]+//; s/[[:space:]]+$//' |
+        grep -Fxq "$DOMAIN" || return 1
+
+    # 检查证书和私钥是否匹配（兼容 ECC/RSA）。
+    local cert_pub key_pub
+    cert_pub=$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+    key_pub=$(openssl pkey -in "$KEY_FILE" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+install_issued_certificate() {
+    # reloadcmd 在服务尚未创建或服务停止时必须正常返回 0。
+    # 这样首次签发不会因为 vless.service 尚不存在而被误判为安装失败。
+    "$ACME_BIN" --install-cert \
+        -d "$DOMAIN" \
+        --ecc \
+        --key-file "$KEY_FILE" \
+        --fullchain-file "$CERT_FILE" \
+        --reloadcmd "if systemctl is-active --quiet ${SERVICE_NAME}.service; then systemctl restart ${SERVICE_NAME}.service; fi" || {
+            err "acme.sh 安装证书文件失败。"
+            return 1
+        }
+
+    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] || {
+        err "证书安装后文件不存在或为空。"
+        return 1
+    }
+
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+
+    if ! certificate_is_valid 3600; then
+        err "安装后的证书域名、有效期或私钥匹配检查失败。"
         return 1
     fi
 
+    return 0
+}
+
+issue_certificate() {
+    info "准备检查 Let's Encrypt 证书..."
+
     install_acme || return 1
+    mkdir -p "$CERT_DIR"
+    chmod 700 "$CERT_DIR"
+
+    # 本地证书有效期超过 30 天：只重新部署到项目目录，不重新签发。
+    if certificate_is_valid 2592000; then
+        success "检测到当前域名已有有效证书（剩余有效期超过 30 天），跳过重复申请。"
+        install_issued_certificate || return 1
+        success "现有证书已安装到项目目录。"
+        return 0
+    fi
+
+    # 证书可能已经由 acme.sh 成功签发，但上次复制到 /opt/vless 时中断。
+    # 先检查 acme.sh 自己保存的证书；有效则直接重新安装，不再次申请。
+    local acme_cert="${ACME_HOME}/${DOMAIN}_ecc/${DOMAIN}.cer"
+    if [[ -s "$acme_cert" ]] &&
+       openssl x509 -in "$acme_cert" -noout -checkend 3600 >/dev/null 2>&1; then
+        info "发现 acme.sh 已签发的证书，尝试重新安装，避免重复签发。"
+        if install_issued_certificate && certificate_is_valid 3600; then
+            success "已复用 acme.sh 中现有证书。"
+            return 0
+        fi
+        warn "现有 ACME 证书无法正常部署，将尝试续期。"
+    fi
+
+    # 已有 ACME 证书但即将过期时，走 renew；没有证书时才走 issue。
+    if [[ -s "$acme_cert" ]]; then
+        info "现有证书即将过期，正在尝试续期..."
+        if ! "$ACME_BIN" --renew -d "$DOMAIN" --ecc --server letsencrypt; then
+            err "现有证书续期失败。"
+            return 1
+        fi
+        install_issued_certificate || return 1
+        success "Let's Encrypt 证书续期及安装完成。"
+        return 0
+    fi
+
+    # HTTP-01 standalone 模式需要 TCP 80 空闲。
+    if ! check_port 80; then
+        err "TCP 80 端口已经被占用，无法使用 standalone 模式申请证书。"
+        show_port_process 80
+        return 1
+    fi
 
     echo
     echo "申请证书前请确认："
     echo
     echo "1. 域名已经添加到 Cloudflare。"
     echo "2. DNS 记录指向当前 VPS 公网 IP。"
-    echo "3. 域名已经开启 Cloudflare 橙色云代理。"
+    echo "3. Cloudflare DNS 记录状态符合 HTTP-01 验证要求。"
     echo "4. VPS 防火墙允许 TCP 80 入站。"
     echo "5. 云服务商安全组允许 TCP 80 入站。"
     echo
@@ -644,38 +764,17 @@ issue_certificate() {
 
     info "正在申请 ${DOMAIN} 的 Let's Encrypt 证书..."
 
-    if ! "$HOME/.acme.sh/acme.sh" \
+    if ! "$ACME_BIN" \
         --issue \
+        --server letsencrypt \
         --standalone \
         -d "$DOMAIN" \
         --keylength ec-256; then
-
-        err "证书申请失败。"
+        err "证书申请失败。请检查 DNS、TCP 80、防火墙和 Cloudflare 代理状态。"
         return 1
     fi
 
-    mkdir -p "$CERT_DIR"
-
-    if ! "$HOME/.acme.sh/acme.sh" \
-        --install-cert \
-        -d "$DOMAIN" \
-        --ecc \
-        --key-file "$KEY_FILE" \
-        --fullchain-file "$CERT_FILE" \
-        --reloadcmd "systemctl restart ${SERVICE_NAME}.service"; then
-
-        err "证书安装失败。"
-        return 1
-    fi
-
-    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
-        err "证书文件不存在或为空。"
-        return 1
-    fi
-
-    chmod 600 "$KEY_FILE"
-    chmod 644 "$CERT_FILE"
-
+    install_issued_certificate || return 1
     success "Let's Encrypt 证书申请及安装完成。"
 }
 
@@ -711,109 +810,105 @@ generate_config() {
         return 1
     fi
 
+    if [[ ! -x "$SINGBOX_BIN" ]]; then
+        err "没有找到 sing-box 核心，请先安装或更新核心。"
+        return 1
+    fi
+
     info "正在生成 sing-box 配置..."
 
-    # 直接将 WS_PATH 作为参数传给 Python。
-    # 不依赖临时环境变量，避免首次安装时变量丢失。
+    # 先生成到临时文件；只有通过 sing-box check 后才替换正式配置。
+    local temp_config="${CONFIG_FILE}.tmp"
+    rm -f "$temp_config"
 
     if ! python3 - \
         "$NODE_FILE" \
-        "$CONFIG_FILE" \
+        "$temp_config" \
         "$CERT_FILE" \
         "$KEY_FILE" \
         "$WS_PATH" \
         <<'PY'
 import json
+import os
 import sys
 import uuid
 
-node_file = sys.argv[1]
-config_file = sys.argv[2]
-cert_file = sys.argv[3]
-key_file = sys.argv[4]
-ws_path = sys.argv[5]
-
+node_file, config_file, cert_file, key_file, ws_path = sys.argv[1:6]
 users = []
+seen = set()
 
 with open(node_file, "r", encoding="utf-8") as f:
-    for line in f:
+    for line_no, line in enumerate(f, 1):
         line = line.rstrip("\r\n")
-
         if not line or "|" not in line:
             continue
 
         user_uuid, name = line.split("|", 1)
-
         try:
-            uuid.UUID(user_uuid)
+            parsed = str(uuid.UUID(user_uuid))
         except ValueError:
-            print("无效 UUID：" + user_uuid)
+            print("节点数据库第 {} 行 UUID 无效：{}".format(line_no, user_uuid))
             sys.exit(1)
 
-        users.append({
-            "name": name,
-            "uuid": user_uuid
-        })
+        if parsed in seen:
+            print("节点数据库存在重复 UUID：{}".format(parsed))
+            sys.exit(1)
+        seen.add(parsed)
+
+        users.append({"name": name, "uuid": parsed})
 
 if not users:
     print("节点数据库中没有有效节点。")
     sys.exit(1)
 
 config = {
-    "log": {
-        "level": "info",
-        "timestamp": True
-    },
-    "inbounds": [
-        {
-            "type": "vless",
-            "tag": "vless-in",
-            "listen": "::",
-            "listen_port": 443,
-            "users": users,
-            "tls": {
-                "enabled": True,
-                "certificate_path": cert_file,
-                "key_path": key_file
-            },
-            "transport": {
-                "type": "ws",
-                "path": ws_path
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
+    "log": {"level": "info", "timestamp": True},
+    "inbounds": [{
+        "type": "vless",
+        "tag": "vless-in",
+        "listen": "::",
+        "listen_port": 443,
+        "users": users,
+        "tls": {
+            "enabled": True,
+            "certificate_path": cert_file,
+            "key_path": key_file
         },
-        {
-            "type": "block",
-            "tag": "block"
+        "transport": {
+            "type": "ws",
+            "path": ws_path
         }
+    }],
+    "outbounds": [
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "block"}
     ]
 }
 
 with open(config_file, "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
-
+    f.write("\n")
 PY
     then
+        rm -f "$temp_config"
         err "配置文件生成失败。"
         return 1
     fi
 
-    chmod 600 "$CONFIG_FILE"
+    chmod 600 "$temp_config"
 
-    # 使用 sing-box 自带命令检查配置。
-
-    if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE"; then
-        err "sing-box 配置检查失败。"
+    if ! "$SINGBOX_BIN" check -c "$temp_config"; then
+        rm -f "$temp_config"
+        err "sing-box 配置检查失败，保留原有配置不变。"
         return 1
     fi
 
+    mv -f "$temp_config" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+
     success "配置生成并检查通过。"
 }
+
 
 
 # ============================================================
@@ -853,7 +948,15 @@ restart_service() {
         return 1
     fi
 
-    systemctl restart "$SERVICE_NAME"
+    if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE"; then
+        err "配置检查失败，取消重启。"
+        return 1
+    fi
+
+    systemctl restart "$SERVICE_NAME" || {
+        err "systemd 重启命令执行失败。"
+        return 1
+    }
 
     sleep 2
 
@@ -1056,82 +1159,57 @@ install_all() {
     fi
 
     install_dependencies || return 1
-
     create_directories
-
     init_node_database
 
-    # 输入域名。
-
-    input_domain
-
-    # 生成 WebSocket 路径。
-
-    generate_ws_path
-
-    # 持久化保存。
-
-    save_settings
-
-    # 安装前检查 TCP 443。
-
-    if ! check_port 443; then
-        err "TCP 443 已经被其他程序占用。"
-        show_port_process 443
+    # 先检查服务端口，避免端口冲突时已经改写域名设置或申请证书。
+    if ! check_port "$LISTEN_PORT"; then
+        err "TCP ${LISTEN_PORT} 已经被其他程序占用。"
+        show_port_process "$LISTEN_PORT"
         return 1
     fi
 
-    # 安装 sing-box。
+    # 如果上一次安装已经保存了域名和 WS 路径，则继续使用，避免重复询问。
+    if [[ -n "$DOMAIN" && -n "$WS_PATH" ]] && validate_domain "$DOMAIN" && validate_ws_path; then
+        info "检测到已保存的域名和 WebSocket 路径，继续使用现有设置。"
+    else
+        input_domain
+        generate_ws_path
+        save_settings
+    fi
 
+    # 核心和证书安装完成后再写入默认节点及正式配置。
     install_singbox || return 1
-
-    # 申请证书。
-
     issue_certificate || return 1
 
-    # 创建第一个默认节点。
-
     local uuid
-
     uuid=$(generate_uuid)
 
     echo "${uuid}|default" >> "$NODE_FILE"
-
     chmod 600 "$NODE_FILE"
-
-    # 生成配置。
 
     if ! generate_config; then
         err "配置生成失败。"
         return 1
     fi
 
-    # 创建 systemd 服务。
-
     create_service
-
-    # 启动服务。
-
     restart_service || return 1
-
-    # 保存脚本并安装快捷命令。
 
     install_shortcut || warn "快捷命令安装失败，请检查 GitHub 下载地址。"
 
     echo
     success "VLESS 安装完成！"
-
     echo
     echo "域名：${DOMAIN}"
     echo "端口：${LISTEN_PORT}"
     echo "WebSocket 路径：${WS_PATH}"
-
     show_node_link "$uuid" "default"
-
     echo
     info "以后可以使用 vl 命令管理节点。"
     echo
 }
+
 
 
 # ============================================================
@@ -1140,9 +1218,7 @@ install_all() {
 
 renew_certificate() {
     echo
-
-    warn "重新申请证书会使用当前保存的域名：${DOMAIN}"
-
+    warn "将检查并更新当前域名证书：${DOMAIN}"
     read -rp "确定继续？(y/n)：" answer
 
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -1150,12 +1226,26 @@ renew_certificate() {
         return 1
     fi
 
-    issue_certificate || return 1
+    install_acme || return 1
+
+    # 证书不存在时执行首次签发；存在时交给 acme.sh 按续期策略处理。
+    if [[ ! -s "$ACME_HOME/${DOMAIN}_ecc/${DOMAIN}.cer" ]]; then
+        issue_certificate || return 1
+    else
+        "$ACME_BIN" --renew -d "$DOMAIN" --ecc --server letsencrypt || {
+            err "acme.sh 续期命令失败。"
+            return 1
+        }
+        install_issued_certificate || return 1
+    fi
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         restart_service
+    else
+        success "证书已更新；VLESS 服务当前未运行，因此没有执行重启。"
     fi
 }
+
 
 
 # ============================================================
